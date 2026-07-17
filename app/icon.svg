@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Rolos">
+  <rect width="256" height="256" rx="48" fill="#f5f5f3"/>
+  <path d="M37 86c0-12 10-22 22-22h138c12 0 22 10 22 22v91c0 12-10 22-22 22H59c-12 0-22-10-22-22V86Z" fill="#1b1b1d"/>
+  <path d="M37 99h182v78c0 12-10 22-22 22H59c-12 0-22-10-22-22V99Z" fill="#111113"/>
+  <rect x="53" y="76" width="59" height="25" rx="5" fill="#dadad6"/>
+  <rect x="124" y="76" width="30" height="25" rx="5" fill="#77777a"/>
+  <rect x="166" y="76" width="37" height="25" rx="5" fill="#dadad6"/>
+  <path d="M49 111h158" stroke="#3a3a3d" stroke-width="4"/>
+  <circle cx="145" cy="145" r="48" fill="#eeeeeb"/>
+  <circle cx="145" cy="145" r="39" fill="#262629"/>
+  <circle cx="145" cy="145" r="29" fill="#0d0d0e" stroke="#c91824" stroke-width="7"/>
+  <circle cx="145" cy="145" r="17" fill="#34343a"/>
+  <circle cx="139" cy="139" r="5" fill="#ffffff" opacity=".75"/>
+  <circle cx="195" cy="126" r="8" fill="#c91824"/>
+  <rect x="59" y="124" width="42" height="29" rx="5" fill="#29292c" stroke="#77777a" stroke-width="3"/>
+  <path d="M59 64h57l8-9h40l8 9h25" fill="none" stroke="#1b1b1d" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M62 212h132" stroke="#c91824" stroke-width="8" stroke-linecap="round"/>
+</svg>

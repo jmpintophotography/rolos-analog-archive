@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="pt-PT">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#18181a">
+    <meta name="robots" content="noindex,nofollow,noarchive">
+    <meta name="referrer" content="strict-origin-when-cross-origin">
+    <meta name="description" content="Arquivo pessoal de fotografia analógica, rolos, stock e equipamento.">
+    <title>Rolos — Arquivo analógico</title>
+    <link rel="icon" href="icon.svg" type="image/svg+xml">
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="access-gate" id="access-gate" aria-live="polite">
+      <div class="access-brand" aria-hidden="true">
+        <span class="access-brand-line"></span>
+        <img src="icon.svg" alt="">
+      </div>
+      <div class="access-content">
+        <p class="kicker">Arquivo privado</p>
+        <h1 data-i18n-skip>Rolos</h1>
+        <p class="access-message" id="access-message">A confirmar a tua sessão segura…</p>
+        <button class="button primary access-signin" id="access-signin" type="button" hidden>
+          <i data-lucide="log-in" aria-hidden="true"></i><span>Entrar com Google</span>
+        </button>
+        <p class="access-owner" id="access-owner"></p>
+      </div>
+      <footer class="access-footer">
+        <i data-lucide="shield-check" aria-hidden="true"></i>
+        <span>Acesso limitado à conta autorizada</span>
+      </footer>
+    </main>
+
+    <div class="app-shell" id="app-shell" hidden>
+      <aside class="sidebar" aria-label="Menu principal">
+        <div class="brand">
+          <div class="brand-mark"><img src="icon.svg" alt=""></div>
+          <div class="brand-copy">
+            <strong data-i18n-skip>Rolos</strong>
+            <span>Arquivo analógico</span>
+          </div>
+        </div>
+
+        <nav class="nav-list" aria-label="Navegação principal">
+          <button class="nav-item active" type="button" data-view="dashboard">
+            <i data-lucide="layout-dashboard" aria-hidden="true"></i><span>Entrada</span>
+          </button>
+          <button class="nav-item" type="button" data-view="rolls">
+            <i data-lucide="film" aria-hidden="true"></i><span>Rolos</span>
+          </button>
+          <button class="nav-item" type="button" data-view="stock">
+            <i data-lucide="package" aria-hidden="true"></i><span>Stock</span>
+          </button>
+          <button class="nav-item" type="button" data-view="stats">
+            <i data-lucide="chart-no-axes-combined" aria-hidden="true"></i><span>Estatísticas</span>
+          </button>
+          <button class="nav-item" type="button" data-view="equipment">
+            <i data-lucide="camera" aria-hidden="true"></i><span>Equipamento</span>
+          </button>
+          <button class="nav-item" type="button" data-view="archive">
+            <i data-lucide="cloud-upload" aria-hidden="true"></i><span>Backup</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div class="sidebar-count">
+            <span>Arquivo</span>
+            <strong id="brand-count">A carregar</strong>
+          </div>
+          <div class="sidebar-status">
+            <span class="status-dot" id="storage-dot"></span>
+            <span id="storage-status">Local</span>
+          </div>
+          <div class="sidebar-version" id="app-version" aria-label="Versão da aplicação">v1.10</div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="topbar-title">
+            <p class="kicker" id="view-kicker">Arquivo analógico</p>
+            <div class="topbar-heading">
+              <h1 id="view-title">Painel</h1>
+              <span class="mobile-version" aria-label="Versão da aplicação">v1.10</span>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <button class="button secondary language-toggle" id="language-toggle" type="button" data-action="toggle-language" aria-label="Mudar para English" title="Mudar para English">
+              <i data-lucide="languages" aria-hidden="true"></i><span>EN</span>
+            </button>
+            <button class="button secondary topbar-backup" type="button" data-action="export-json" aria-label="Exportar backup" title="Exportar backup">
+              <i data-lucide="download" aria-hidden="true"></i><span>Exportar backup</span>
+            </button>
+            <button class="button primary" type="button" data-action="new-roll" aria-label="Novo rolo" title="Novo rolo">
+              <i data-lucide="plus" aria-hidden="true"></i><span>Novo rolo</span>
+            </button>
+          </div>
+        </header>
+
+        <section class="drive-reminder" id="drive-reminder" aria-live="polite" hidden></section>
+        <section class="content" id="app-root" aria-live="polite"></section>
+      </main>
+    </div>
+
+    <dialog class="dialog" id="editor-dialog">
+      <form method="dialog" class="dialog-surface" id="editor-form">
+        <div class="dialog-header">
+          <div>
+            <p class="kicker" id="dialog-kicker">Registo</p>
+            <h2 id="dialog-title">Editar</h2>
+          </div>
+          <button class="icon-button" type="button" data-action="close-dialog" aria-label="Fechar" title="Fechar">
+            <i data-lucide="x" aria-hidden="true"></i>
+          </button>
+        </div>
+        <div class="form-grid" id="editor-fields"></div>
+        <div class="dialog-actions">
+          <button class="button danger ghost" type="button" data-action="delete-item">
+            <i data-lucide="trash-2" aria-hidden="true"></i><span>Eliminar</span>
+          </button>
+          <div class="dialog-action-group">
+            <button class="button secondary" type="button" data-action="close-dialog">Cancelar</button>
+            <button class="button primary" type="submit">
+              <i data-lucide="check" aria-hidden="true"></i><span>Guardar</span>
+            </button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog detail-dialog" id="detail-dialog">
+      <div class="dialog-surface">
+        <div class="dialog-header">
+          <div>
+            <p class="kicker" id="detail-kicker">Rolo</p>
+            <h2 id="detail-title">Detalhes</h2>
+          </div>
+          <button class="icon-button" type="button" data-action="close-detail" aria-label="Fechar" title="Fechar">
+            <i data-lucide="x" aria-hidden="true"></i>
+          </button>
+        </div>
+        <div id="detail-content"></div>
+        <div class="dialog-actions">
+          <button class="button secondary" type="button" data-action="detail-edit">
+            <i data-lucide="pencil" aria-hidden="true"></i><span>Editar</span>
+          </button>
+          <div class="dialog-action-group">
+            <button class="button secondary" type="button" data-action="close-detail">Fechar</button>
+            <button class="button primary" id="detail-primary-action" type="button" data-action="detail-advance-status">Avançar estado</button>
+          </div>
+        </div>
+      </div>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script src="app-config.js"></script>
+    <script src="firebase-config.js"></script>
+    <script src="data/seed.js"></script>
+    <script src="data/film-images.js"></script>
+    <script src="vendor/lucide.min.js"></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

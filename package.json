@@ -1,0 +1,14 @@
+{
+  "name": "rolos-analog-archive",
+  "version": "1.10.0",
+  "private": true,
+  "type": "module",
+  "description": "A private-first archive for analogue film rolls, stock and equipment.",
+  "scripts": {
+    "test": "node tests/run-tests.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
