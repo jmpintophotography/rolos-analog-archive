@@ -1,0 +1,8 @@
+.DS_Store
+Thumbs.db
+*.zip
+*.log
+node_modules/
+app/firebase-config.private.js
+backups/
+screenshots/private/
