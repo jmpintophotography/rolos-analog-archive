@@ -3,8 +3,8 @@
     "appName": "Rolos",
     "importedAt": "2026-07-17T12:00:00.000Z",
     "updatedAt": "2026-07-17T12:00:00.000Z",
-    "seedRevision": "2026-07-17-v1.10-demo",
-    "releaseVersion": "1.10",
+    "seedRevision": "2026-07-18-v1.11-demo",
+    "releaseVersion": "1.11",
     "version": 5
   },
   "rolls": [
@@ -281,4 +281,3 @@
     "equipmentStatuses": ["Funcional", "Vendido", "Avariado", "Emprestado"]
   }
 }
-

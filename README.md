@@ -13,6 +13,8 @@ The project was designed and built with help from OpenAI Codex.
 ## Main features
 
 - Roll workflow from `In use` to `Archived`.
+- Progressive new-roll form with quick choices for recent cameras, locations and film stock.
+- One-step roll loading from stock and `New similar roll` from an existing record.
 - Film stock, expiry dates and packaging images.
 - Camera, lens and accessory catalogue.
 - Search, filters, statistics and location map.

@@ -1,4 +1,4 @@
-const CACHE_NAME = "rolos-app-v1-10-20260717-geocoding-i18n-r3";
+const CACHE_NAME = "rolos-app-v1-11-20260718-qol-r1";
 const APP_SHELL = [
   "./",
   "./index.html",

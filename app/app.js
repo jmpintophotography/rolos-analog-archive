@@ -29,8 +29,8 @@ const UI_STORAGE_KEY = "rolos-app-ui-v4";
 const DEVICE_STORAGE_KEY = "rolos-app-device-v1";
 const DRIVE_STATUS_STORAGE_KEY = "rolos-drive-backup-status-v1";
 const LANGUAGE_STORAGE_KEY = "rolos-app-language-v1";
-const RELEASE_VERSION = "1.10";
-const SEED_REVISION = "2026-07-15-v1.0";
+const RELEASE_VERSION = "1.11";
+const SEED_REVISION = "2026-07-18-v1.11";
 const FIREBASE_VERSION = "10.12.5";
 const XLSX_CDN_URL = "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js";
 const FIREBASE_OPTION_KEYS = ["apiKey", "authDomain", "projectId", "storageBucket", "messagingSenderId", "appId", "measurementId"];
@@ -221,6 +221,7 @@ async function init() {
   if (!accessGranted) return;
   bindEvents();
   app.state = normalizeState(await loadState());
+  app.state.meta.releaseVersion = RELEASE_VERSION;
   app.cloud.driveStatus = loadLocalDriveBackupStatus();
   loadUiPreferences();
   persistState({ skipAutomaticBackup: true, preserveUpdatedAt: true });
@@ -643,6 +644,7 @@ function normalizeState(raw) {
       ...(raw.meta || {}),
       ...normalizeCloudBackupMeta(raw.meta),
       version: 5,
+      releaseVersion: RELEASE_VERSION,
     },
     rolls: Array.isArray(raw.rolls) ? raw.rolls : [],
     stock: Array.isArray(raw.stock) ? raw.stock : [],
@@ -996,7 +998,7 @@ function renderPrivateInitialization() {
         <button class="button secondary" type="button" data-action="cloud-pull">Verificar backup existente</button>
       </div>
       <ol>
-        <li>Escolhe <strong>BACKUP_INICIAL_ROLOS-v1.04-326-ROLOS.json</strong>.</li>
+        <li>Escolhe <strong>BACKUP_INICIAL_ROLOS-v1.11-326-ROLOS.json</strong>.</li>
         <li>Confirma que aparecem 326 rolos.</li>
         <li>Vai a <strong>Backup</strong> e aguarda a confirmação da sincronização.</li>
       </ol>
@@ -1830,6 +1832,7 @@ function stockCatalogCard(item) {
         </div>
         ${item.note ? `<p>${escapeHtml(item.note)}</p>` : ""}
         <footer>
+          <button class="button primary compact-button" type="button" data-action="new-roll-from-stock" data-id="${escapeAttr(item.id)}" ${numberOrZero(item.quantity) > 0 ? "" : "disabled"}>${uiIcon("circle-plus")}<span>Carregar rolo</span></button>
           <button class="button secondary compact-button" type="button" data-action="edit-stock" data-id="${escapeAttr(item.id)}">${uiIcon("pencil")}<span>Editar stock</span></button>
         </footer>
       </div>
@@ -1889,7 +1892,7 @@ function rollListView(rolls) {
 }
 
 function stockListView(stock) {
-  const rows = stock.map((item) => `<tr><td>${escapeHtml(item.format)}</td><td>${escapeHtml(item.brand)}</td><td>${escapeHtml(item.model)}</td><td>${escapeHtml(item.iso)}</td><td>${escapeHtml(item.type)}</td><td>${formatNumber(item.quantity)}</td><td>${stockPill(item.condition)}</td><td>${formatDate(item.expiryDate)}</td><td>${escapeHtml(item.note)}</td><td class="table-action"><button class="button secondary compact-button" type="button" data-action="edit-stock" data-id="${escapeAttr(item.id)}">${uiIcon("pencil")}<span>Editar</span></button></td></tr>`).join("");
+  const rows = stock.map((item) => `<tr><td>${escapeHtml(item.format)}</td><td>${escapeHtml(item.brand)}</td><td>${escapeHtml(item.model)}</td><td>${escapeHtml(item.iso)}</td><td>${escapeHtml(item.type)}</td><td>${formatNumber(item.quantity)}</td><td>${stockPill(item.condition)}</td><td>${formatDate(item.expiryDate)}</td><td>${escapeHtml(item.note)}</td><td class="table-action"><div class="table-action-stack"><button class="button primary compact-button" type="button" data-action="new-roll-from-stock" data-id="${escapeAttr(item.id)}" ${numberOrZero(item.quantity) > 0 ? "" : "disabled"}>${uiIcon("circle-plus")}<span>Carregar</span></button><button class="button secondary compact-button" type="button" data-action="edit-stock" data-id="${escapeAttr(item.id)}">${uiIcon("pencil")}<span>Editar</span></button></div></td></tr>`).join("");
   return `<section class="panel collection-list-panel"><div class="list-table"><table class="stock-table"><thead><tr><th>Formato</th><th>Marca</th><th>Modelo</th><th>ISO</th><th>Tipo</th><th>Qtd</th><th>Estado</th><th>Validade</th><th>Nota</th><th class="table-action">Ação</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
 }
 
@@ -2898,6 +2901,9 @@ async function handleAction(event) {
 
   if (action === "toggle-language") toggleLanguage();
   if (action === "new-roll") openEditor("roll");
+  if (action === "new-roll-from-stock") openNewRollFromStock(id);
+  if (action === "duplicate-roll") duplicateRoll(id);
+  if (action === "apply-roll-preset") applyRollPreset(button.dataset.preset, id || button.dataset.value);
   if (action === "set-view-mode") {
     const collection = button.dataset.collection;
     const mode = button.dataset.mode;
@@ -3085,14 +3091,22 @@ async function createFilmThumbnail(file) {
   }
 }
 
-function openEditor(type, id = null) {
-  const item = id ? findItem(type, id) : defaultItem(type);
+function openEditor(type, id = null, options = {}) {
+  const baseItem = id ? findItem(type, id) : defaultItem(type);
+  const item = baseItem && !id && options.prefill
+    ? { ...baseItem, ...options.prefill }
+    : baseItem;
   if (!item) {
     showToast("Não encontrei esse registo.");
     return;
   }
 
-  app.editor = { type, id, item: structuredClone(item) };
+  app.editor = {
+    type,
+    id,
+    item: structuredClone(item),
+    stockItemId: text(options.stockItemId),
+  };
   dialogTitle.textContent = id ? editorTitle(type, item) : newEditorTitle(type);
   dialogKicker.textContent = editorKicker(type);
   editorFields.innerHTML = renderEditorFields(type, app.editor.item);
@@ -3100,6 +3114,86 @@ function openEditor(type, id = null) {
   document.querySelector('[data-action="delete-item"]').style.display = id ? "inline-flex" : "none";
   dialog.showModal();
   refreshIcons();
+}
+
+function openNewRollFromStock(id) {
+  const stockItem = findItem("stock", id);
+  if (!stockItem) {
+    showToast("Não encontrei esse stock.");
+    return;
+  }
+  openEditor("roll", null, {
+    stockItemId: stockItem.id,
+    prefill: rollCaptureFromStock(stockItem),
+  });
+}
+
+function duplicateRoll(id) {
+  const source = findItem("roll", id);
+  if (!source) {
+    showToast("Não encontrei esse rolo.");
+    return;
+  }
+  closeDetails();
+  openEditor("roll", null, {
+    prefill: {
+      camera: source.camera,
+      lens: source.lens,
+      filmBrand: source.filmBrand,
+      filmModel: source.filmModel,
+      iso: source.iso,
+      format: source.format,
+      type: source.type,
+      push: source.push,
+    },
+  });
+}
+
+function rollCaptureFromStock(stockItem) {
+  return {
+    filmBrand: stockItem.brand,
+    filmModel: stockItem.model,
+    iso: stockItem.iso,
+    format: stockItem.format,
+    type: stockItem.type,
+  };
+}
+
+function applyRollPreset(preset, value) {
+  if (!app.editor || app.editor.type !== "roll" || app.editor.id) return;
+
+  if (preset === "camera") {
+    const camera = text(value);
+    const recentMatch = sortRolls(app.state.rolls).find((roll) => roll.camera === camera);
+    setEditorFieldValue("camera", camera);
+    if (recentMatch?.lens) setEditorFieldValue("lens", recentMatch.lens);
+  }
+
+  if (preset === "location") {
+    setEditorFieldValue("shotLocation", text(value));
+  }
+
+  if (preset === "stock") {
+    const stockItem = findItem("stock", value);
+    if (!stockItem) return;
+    Object.entries(rollCaptureFromStock(stockItem))
+      .forEach(([name, fieldValue]) => setEditorFieldValue(name, fieldValue));
+    app.editor.stockItemId = stockItem.id;
+    const stockChoice = editorFields.querySelector('[data-stock-consumption]');
+    const checkbox = editorForm.elements.consumeStock;
+    if (stockChoice) stockChoice.hidden = false;
+    if (checkbox) checkbox.checked = numberOrZero(stockItem.quantity) > 0;
+    editorFields.querySelectorAll('[data-preset="stock"]').forEach((button) => {
+      button.classList.toggle("selected", button.dataset.id === stockItem.id);
+    });
+  }
+
+  refreshComputedFields();
+}
+
+function setEditorFieldValue(name, value) {
+  const input = editorForm.elements[name];
+  if (input) input.value = value ?? "";
 }
 
 function closeEditor() {
@@ -3136,6 +3230,7 @@ function renderDetails(roll) {
       <div class="detail-status-block">
         ${statusPill(roll.status)}
         ${next ? `<button class="button primary" type="button" data-action="advance-status" data-id="${escapeAttr(roll.id)}">Avançar</button>` : `<span class="closed-label">Fechado</span>`}
+        <button class="button secondary compact-button" type="button" data-action="duplicate-roll" data-id="${escapeAttr(roll.id)}">${uiIcon("copy-plus")}<span>Novo semelhante</span></button>
       </div>
     </section>
 
@@ -3185,6 +3280,12 @@ function saveEditor(event) {
   event.preventDefault();
   if (!app.editor) return;
   const editorType = app.editor.type;
+  const isNewRoll = editorType === "roll" && !app.editor.id;
+  const stockItemId = isNewRoll && editorForm.elements.consumeStock?.checked
+    ? text(app.editor.stockItemId)
+    : "";
+  let stockWasUpdated = false;
+  let selectedStockWasEmpty = false;
 
   const fields = fieldsFor(app.editor.type);
   const values = {};
@@ -3230,11 +3331,25 @@ function saveEditor(event) {
     app.state[collection].push({ ...values, id: values.id || createId(app.editor.type) });
   }
 
+  if (stockItemId) {
+    const stockItem = app.state.stock.find((item) => item.id === stockItemId);
+    if (stockItem && numberOrZero(stockItem.quantity) > 0) {
+      stockItem.quantity = numberOrZero(stockItem.quantity) - 1;
+      stockWasUpdated = true;
+    } else {
+      selectedStockWasEmpty = true;
+    }
+  }
+
   app.state = normalizeState(app.state);
   persistState();
   closeEditor();
   render();
-  showToast("Guardado.");
+  showToast(stockWasUpdated
+    ? "Rolo guardado e stock atualizado."
+    : selectedStockWasEmpty
+      ? "Rolo guardado. O stock selecionado já estava a zero."
+      : "Guardado.");
   if (editorType === "roll") {
     const savedRoll = app.state.rolls.find((roll) => roll.id === values.id);
     if (savedRoll) void geocodeRollLocations(savedRoll);
@@ -3263,38 +3378,91 @@ function renderEditorFields(type, item) {
     sectionFields.forEach((field) => renderedNames.add(field.name));
     if (!sectionFields.length) return "";
     return `
-      <fieldset class="form-section">
-        <legend>${escapeHtml(group.label)}</legend>
+      <details class="form-section" ${group.open ? "open" : ""}>
+        <summary>${escapeHtml(group.label)}${uiIcon("chevron-down")}</summary>
         <div class="form-section-grid">${sectionFields.map((field) => renderField(field, item)).join("")}</div>
-      </fieldset>
+      </details>
     `;
   });
   const remaining = fields.filter((field) => !renderedNames.has(field.name));
   if (remaining.length) {
-    sections.push(`<fieldset class="form-section"><legend>Outros dados</legend><div class="form-section-grid">${remaining.map((field) => renderField(field, item)).join("")}</div></fieldset>`);
+    sections.push(`<details class="form-section"><summary>Outros dados${uiIcon("chevron-down")}</summary><div class="form-section-grid">${remaining.map((field) => renderField(field, item)).join("")}</div></details>`);
   }
-  return sections.join("");
+  const quickStart = type === "roll" && !app.editor?.id ? renderRollQuickStart() : "";
+  return quickStart + sections.join("");
 }
 
 function editorFieldGroups(type) {
   if (type === "roll") {
+    if (!app.editor?.id) {
+      return [
+        { label: "Dados essenciais", fields: ["date", "camera", "lens", "filmBrand", "filmModel", "iso", "format", "type", "push", "shotLocation"], open: true },
+        { label: "Identificação automática", fields: ["id", "status", "negativeCode"], open: false },
+        { label: "Processamento", fields: ["developedAt", "scannedAt", "developerMethod"], open: false },
+        { label: "Arquivo e notas", fields: ["folderName", "photosUrl", "archiveLocation", "favorite", "notes"], open: false },
+      ];
+    }
     return [
-      { label: "Identificação", fields: ["id", "status", "date", "negativeCode"] },
-      { label: "Captura", fields: ["camera", "lens", "filmBrand", "filmModel", "iso", "format", "type", "push", "shotLocation"] },
-      { label: "Processamento", fields: ["developedAt", "scannedAt", "developerMethod"] },
-      { label: "Arquivo", fields: ["folderName", "photosUrl", "archiveLocation", "favorite", "notes"] },
+      { label: "Identificação", fields: ["id", "status", "date", "negativeCode"], open: true },
+      { label: "Captura", fields: ["camera", "lens", "filmBrand", "filmModel", "iso", "format", "type", "push", "shotLocation"], open: true },
+      { label: "Processamento", fields: ["developedAt", "scannedAt", "developerMethod"], open: true },
+      { label: "Arquivo", fields: ["folderName", "photosUrl", "archiveLocation", "favorite", "notes"], open: true },
     ];
   }
   if (type === "stock") {
     return [
-      { label: "Filme", fields: ["brand", "model", "format", "iso", "type"] },
-      { label: "Inventário", fields: ["quantity", "condition", "expiryDate", "note"] },
+      { label: "Filme", fields: ["brand", "model", "format", "iso", "type"], open: true },
+      { label: "Inventário", fields: ["quantity", "condition", "expiryDate", "note"], open: true },
     ];
   }
   return [
-    { label: "Identificação", fields: ["kind", "brand", "model", "system", "status"] },
-    { label: "Compra e manutenção", fields: ["purchaseDate", "purchaseValue", "lastServiceDate", "notes"] },
+    { label: "Identificação", fields: ["kind", "brand", "model", "system", "status"], open: true },
+    { label: "Compra e manutenção", fields: ["purchaseDate", "purchaseValue", "lastServiceDate", "notes"], open: true },
   ];
+}
+
+function renderRollQuickStart() {
+  const recentRolls = sortRolls(app.state.rolls);
+  const cameras = recentUniqueValues(recentRolls, (roll) => roll.camera, 4);
+  const locations = recentUniqueValues(recentRolls, (roll) => roll.shotLocation, 4);
+  const stockItems = app.state.stock
+    .filter((item) => numberOrZero(item.quantity) > 0)
+    .sort((a, b) => localeSort(a.brand, b.brand) || localeSort(a.model, b.model))
+    .slice(0, 8);
+  const selectedStockId = text(app.editor?.stockItemId);
+
+  return `
+    <section class="roll-quick-start">
+      <div class="quick-start-heading">
+        <div>
+          <span class="catalog-overline">Preenchimento rápido</span>
+          <strong>Escolhe o que já tens e evita voltar a escrever.</strong>
+        </div>
+        ${uiIcon("zap")}
+      </div>
+      ${cameras.length ? `<div class="quick-preset-row"><span>Câmara recente</span><div>${cameras.map((camera) => `<button class="quick-preset" type="button" data-action="apply-roll-preset" data-preset="camera" data-value="${escapeAttr(camera)}">${uiIcon("camera")}<span>${escapeHtml(camera)}</span></button>`).join("")}</div></div>` : ""}
+      ${stockItems.length ? `<div class="quick-preset-row"><span>Filme em stock</span><div>${stockItems.map((stockItem) => `<button class="quick-preset ${selectedStockId === stockItem.id ? "selected" : ""}" type="button" data-action="apply-roll-preset" data-preset="stock" data-id="${escapeAttr(stockItem.id)}">${uiIcon("package")}<span>${escapeHtml(stockItem.brand)} ${escapeHtml(stockItem.model)} · ISO ${escapeHtml(stockItem.iso)}</span><small>${formatNumber(stockItem.quantity)}</small></button>`).join("")}</div></div>` : ""}
+      ${locations.length ? `<div class="quick-preset-row"><span>Local recente</span><div>${locations.map((location) => `<button class="quick-preset" type="button" data-action="apply-roll-preset" data-preset="location" data-value="${escapeAttr(location)}">${uiIcon("map-pin")}<span>${escapeHtml(location)}</span></button>`).join("")}</div></div>` : ""}
+      <label class="quick-stock-choice" data-stock-consumption ${selectedStockId ? "" : "hidden"}>
+        <input type="checkbox" name="consumeStock" ${selectedStockId ? "checked" : ""}>
+        <span>Retirar uma unidade deste stock ao guardar</span>
+      </label>
+    </section>
+  `;
+}
+
+function recentUniqueValues(items, picker, limit) {
+  const values = [];
+  const seen = new Set();
+  for (const item of items) {
+    const value = text(picker(item));
+    const key = normalizeSearchValue(value);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    values.push(value);
+    if (values.length >= limit) break;
+  }
+  return values;
 }
 
 function renderField(field, item) {
@@ -4055,7 +4223,7 @@ async function importJson(file) {
     const imported = normalizeState(JSON.parse(textValue));
     const bundledSeed = await loadSeed();
     imported.meta.seedRevision = bundledSeed.meta?.seedRevision || imported.meta.seedRevision || app.state.meta.seedRevision || SEED_REVISION;
-    imported.meta.releaseVersion = imported.meta.releaseVersion || app.state.meta.releaseVersion || RELEASE_VERSION;
+    imported.meta.releaseVersion = RELEASE_VERSION;
     app.state = imported;
     persistState();
     render();
@@ -4076,7 +4244,7 @@ async function importExcel(file) {
     const imported = normalizeState(buildStateFromExcelWorkbook(workbook, file.name));
     const bundledSeed = await loadSeed();
     imported.meta.seedRevision = bundledSeed.meta?.seedRevision || imported.meta.seedRevision || app.state.meta.seedRevision || SEED_REVISION;
-    imported.meta.releaseVersion = imported.meta.releaseVersion || app.state.meta.releaseVersion || RELEASE_VERSION;
+    imported.meta.releaseVersion = RELEASE_VERSION;
     app.state = normalizeState(mergeSeedUpgrade(app.state, imported));
     persistState();
     render();

@@ -16,14 +16,18 @@ const firebaseConfig = await read("app/firebase-config.js");
 assert.equal(seed.rolls.length, 10, "The public database must contain exactly 10 demo rolls.");
 assert.ok(seed.rolls.every((roll) => roll.createdFrom === "demo"));
 assert.ok(seed.rolls.every((roll) => !roll.photosUrl));
-assert.equal(seed.meta.releaseVersion, "1.10");
+assert.equal(seed.meta.releaseVersion, "1.11");
 assert.match(firebaseConfig, /demoMode:\s*true/);
 assert.match(firebaseConfig, /privateAccess:\s*false/);
-assert.match(appSource, /const RELEASE_VERSION = "1\.10"/);
+assert.match(appSource, /const RELEASE_VERSION = "1\.11"/);
 assert.match(appSource, /Organiza cada rolo, acompanha o processo e mantém o foco na fotografia\./);
 assert.doesNotMatch(appSource, /Registos e Stock v3\.xlsx/);
 assert.match(indexSource, /data-action="toggle-language"/);
-assert.match(indexSource, />v1\.10</);
+assert.match(indexSource, />v1\.11</);
+assert.match(appSource, /data-action="new-roll-from-stock"/);
+assert.match(appSource, /data-action="duplicate-roll"/);
+assert.match(appSource, /Preenchimento rápido/);
+assert.match(appSource, /consumeStock/);
 assert.match(swSource, /\.\/geocoding\.js/);
 assert.match(swSource, /\.\/i18n\.js/);
 assert.doesNotMatch(swSource, /film-packages/);
@@ -81,7 +85,7 @@ for (const path of await walk(root)) {
   }
 }
 
-console.log("Rolos v1.10 public checks passed: demo data, privacy, translations, geocoding and offline shell.");
+console.log("Rolos v1.11 public checks passed: demo data, privacy, quality-of-life actions, translations, geocoding and offline shell.");
 
 async function walk(directory) {
   const paths = [];

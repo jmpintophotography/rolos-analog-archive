@@ -331,6 +331,22 @@ const PT_TO_EN = {
   "Sem dados para mostrar.": "No data to display.",
   "Sem locais para mostrar.": "No locations to display.",
   "Ainda não há locais com coordenadas para mostrar no mapa.": "There are no locations with coordinates to display on the map yet.",
+  "Novo semelhante": "New similar roll",
+  "Carregar rolo": "Load roll",
+  "Carregar": "Load",
+  "Preenchimento rápido": "Quick fill",
+  "Escolhe o que já tens e evita voltar a escrever.": "Choose what you already have and avoid typing it again.",
+  "Câmara recente": "Recent camera",
+  "Filme em stock": "Film in stock",
+  "Local recente": "Recent location",
+  "Retirar uma unidade deste stock ao guardar": "Remove one unit from this stock when saving",
+  "Dados essenciais": "Essential details",
+  "Identificação automática": "Automatic identification",
+  "Arquivo e notas": "Archive and notes",
+  "Outros dados": "Other details",
+  "Não encontrei esse stock.": "I could not find that stock item.",
+  "Rolo guardado e stock atualizado.": "Roll saved and stock updated.",
+  "Rolo guardado. O stock selecionado já estava a zero.": "Roll saved. The selected stock was already at zero.",
 };
 
 const EN_TO_PT = Object.fromEntries(Object.entries(PT_TO_EN).map(([pt, en]) => [en, pt]));

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.11.0 - 2026-07-18
+
+- Added a shorter, progressive new-roll form while keeping every existing field available.
+- Added quick choices for recent cameras, recent locations and film currently in stock.
+- Added one-step roll creation from stock, with an optional automatic stock decrement.
+- Added `New similar roll` from an existing roll.
+- Updated private recovery data to the latest 18 July backup and expanded migration and release checks.
+
 ## 1.10.0 - 2026-07-17
 
 - Added automatic coordinates for newly saved location names, with caching, throttling and graceful offline behavior.
