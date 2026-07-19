@@ -3,10 +3,15 @@ import {
   SYNC_SCHEMA_VERSION,
   WEEKLY_BACKUP_LIMIT,
   chooseSyncAction,
+  cloudArchiveResetPlan,
+  cloudHistoryDeletionPlan,
+  cloudRecordApproximateBytes,
+  cloudStorageSummary,
   evaluateCloudWrite,
   formatIsoWeekKey,
   historyRetentionPlan,
   isoWeekKey,
+  requiresSyncSchemaUpgrade,
   shouldReplaceWeeklyBackup,
   stateFingerprint,
 } from "./sync-core.js";
@@ -17,20 +22,41 @@ import {
 import { createDriveBackupClient } from "./drive-backup-client.js";
 import { createGeocodingClient } from "./geocoding.js";
 import {
+  calendarValueToIso,
+  localCalendarDateToIso,
+  nextRollIdForMonth,
+  reconcileImportedRollDates,
+  rollCalendarFromId,
+} from "./calendar-dates.js";
+import {
   applyLanguage,
   localeForLanguage,
   normalizeLanguage,
   startLanguageObserver,
   translatePhrase,
 } from "./i18n.js";
+import {
+  applyBatchArchiveUpdate,
+  archiveIntegrityReport,
+  backupRestoreDiff,
+  captureFields,
+  captureTemplateFromRoll,
+  financialSummary,
+  normalizeV25Workspace,
+  processingDurationSummary,
+  qrSvgForRollId,
+  rollCost,
+  stockForecast,
+} from "./v25-core.js";
 
 const STORAGE_KEY = "rolos-app-state-v1";
 const UI_STORAGE_KEY = "rolos-app-ui-v4";
 const DEVICE_STORAGE_KEY = "rolos-app-device-v1";
 const DRIVE_STATUS_STORAGE_KEY = "rolos-drive-backup-status-v1";
 const LANGUAGE_STORAGE_KEY = "rolos-app-language-v1";
-const RELEASE_VERSION = "1.11";
-const SEED_REVISION = "2026-07-18-v1.11";
+const IMPORT_REPLACEMENT_STORAGE_KEY = "rolos-import-replacement-pending-v1";
+const RELEASE_VERSION = "2.5";
+const SEED_REVISION = "2026-07-18-v2.1";
 const FIREBASE_VERSION = "10.12.5";
 const XLSX_CDN_URL = "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js";
 const FIREBASE_OPTION_KEYS = ["apiKey", "authDomain", "projectId", "storageBucket", "messagingSenderId", "appId", "measurementId"];
@@ -92,6 +118,10 @@ const views = {
     title: "Equipamento",
     kicker: "Câmaras, lentes e acessórios",
   },
+  review: {
+    title: "Revisão",
+    kicker: "O que merece atenção",
+  },
   archive: {
     title: "Backup",
     kicker: "Cópias e sincronização",
@@ -125,6 +155,7 @@ const app = {
     rollsCamera: "",
     rollsFormat: "",
     rollsType: "",
+    rollsFavorite: "",
     rollsSort: "newest",
     statsCamera: "",
     statsFilm: "",
@@ -154,6 +185,11 @@ const app = {
   },
   editor: null,
   detailId: null,
+  commandQuery: "",
+  undo: null,
+  reviewFilter: "all",
+  physicalSelection: new Set(),
+  physicalSearch: "",
   dashboardFilter: "open",
   rollLimit: 50,
   startupWarning: "",
@@ -178,12 +214,16 @@ const app = {
     historyLoading: false,
     historyLoadedAt: 0,
     historyError: "",
+    historyUsage: null,
+    historyDeleting: false,
+    devices: [],
     driveStatus: null,
     driveStatusUnsubscribe: null,
     driveBackupInProgress: false,
     driveBackupError: "",
   },
   geocodingPending: new Set(),
+  scanner: null,
 };
 
 const appShell = document.querySelector("#app-shell") || document.querySelector(".app-shell");
@@ -203,11 +243,15 @@ const editorForm = document.querySelector("#editor-form");
 const editorFields = document.querySelector("#editor-fields");
 const dialogTitle = document.querySelector("#dialog-title");
 const dialogKicker = document.querySelector("#dialog-kicker");
+const saveAndAddButton = document.querySelector("#save-and-add-button");
 const detailDialog = document.querySelector("#detail-dialog");
 const detailTitle = document.querySelector("#detail-title");
 const detailKicker = document.querySelector("#detail-kicker");
 const detailContent = document.querySelector("#detail-content");
 const detailPrimaryAction = document.querySelector("#detail-primary-action");
+const commandDialog = document.querySelector("#command-dialog");
+const commandSearch = document.querySelector("#command-search");
+const commandResults = document.querySelector("#command-results");
 const toast = document.querySelector("#toast");
 const languageToggle = document.querySelector("#language-toggle");
 
@@ -231,6 +275,7 @@ async function init() {
   }
   app.ready = true;
   render();
+  handleLaunchShortcut();
   startCloudSyncListener();
   startDriveStatusListener();
   if (app.state.meta.autoCloudBackup && app.state.meta.cloudBackupPending) {
@@ -416,6 +461,9 @@ async function handleCloudAuthenticationState(user) {
 
   if (!user) {
     app.cloud.user = null;
+    app.cloud.history = [];
+    app.cloud.historyUsage = null;
+    app.cloud.historyLoadedAt = 0;
     app.cloud.status = "Sessão por iniciar.";
     if (isPrivateAccessRequired()) {
       showAccessGate({
@@ -482,6 +530,9 @@ function bindEvents() {
   editorFields.addEventListener("input", refreshComputedFields);
   editorFields.addEventListener("change", refreshComputedFields);
   editorForm.addEventListener("submit", saveEditor);
+  commandSearch?.addEventListener("input", handleCommandInput);
+  commandSearch?.addEventListener("keydown", handleCommandKeydown);
+  document.addEventListener("keydown", handleGlobalKeydown);
   window.addEventListener?.("online", () => {
     if (app.ready && app.state?.meta?.autoCloudBackup) scheduleCloudSyncCheck(100);
   });
@@ -530,7 +581,11 @@ async function loadState() {
 function mergeSeedUpgrade(localState, seedState) {
   const localRolls = new Map((localState.rolls || []).map((roll) => [normalizeRollId(roll.id), roll]));
   const seedRollIds = new Set((seedState.rolls || []).map((roll) => normalizeRollId(roll.id)));
-  const preserveRollFields = ["photosUrl", "archiveLocation", "favorite"];
+  const preserveRollFields = [
+    "photosUrl", "archiveLocation", "favorite", "project", "filmCost", "developmentCost", "scanCost",
+    "negativePresent", "contactSheetPresent", "scanFilesPresent", "shotCompletedAt", "developmentCompletedAt",
+    "scanCompletedAt", "archivedAt", "archiveUpdatedAt",
+  ];
   const rolls = (seedState.rolls || []).map((roll) => {
     const local = localRolls.get(normalizeRollId(roll.id));
     if (!local) return roll;
@@ -563,6 +618,7 @@ function mergeSeedUpgrade(localState, seedState) {
     ],
     filmImages: localState.filmImages || {},
     locationCoordinates: localState.locationCoordinates || {},
+    workflow: normalizeV25Workspace(localState.workflow),
   };
 }
 
@@ -592,6 +648,7 @@ function seedForCurrentMode(seed) {
     equipment: [],
     filmImages: {},
     locationCoordinates: {},
+    workflow: normalizeV25Workspace(),
     support: {
       ...(seed.support || {}),
       filmBrands: [],
@@ -651,6 +708,7 @@ function normalizeState(raw) {
     equipment: Array.isArray(raw.equipment) ? raw.equipment : [],
     filmImages: raw.filmImages && typeof raw.filmImages === "object" ? raw.filmImages : {},
     locationCoordinates: normalizeLocationCoordinates(raw.locationCoordinates),
+    workflow: normalizeV25Workspace(raw.workflow),
     support: {
       ...defaultSupport,
       ...(raw.support || {}),
@@ -679,6 +737,18 @@ function normalizeState(raw) {
     negativeCode: text(roll.negativeCode) || text(roll.id),
     archiveLocation: text(roll.archiveLocation),
     favorite: Boolean(roll.favorite),
+    project: text(roll.project),
+    filmCost: numberOrZero(roll.filmCost),
+    developmentCost: numberOrZero(roll.developmentCost),
+    scanCost: numberOrZero(roll.scanCost),
+    negativePresent: Boolean(roll.negativePresent),
+    contactSheetPresent: Boolean(roll.contactSheetPresent),
+    scanFilesPresent: Boolean(roll.scanFilesPresent),
+    shotCompletedAt: text(roll.shotCompletedAt),
+    developmentCompletedAt: text(roll.developmentCompletedAt),
+    scanCompletedAt: text(roll.scanCompletedAt),
+    archivedAt: text(roll.archivedAt),
+    archiveUpdatedAt: text(roll.archiveUpdatedAt),
     createdFrom: text(roll.createdFrom),
   }));
 
@@ -705,6 +775,8 @@ function normalizeState(raw) {
     quantity: numberOrZero(item.quantity),
     condition: text(item.condition),
     expiryDate: text(item.expiryDate),
+    unitCost: numberOrZero(item.unitCost),
+    purchasedAt: text(item.purchasedAt),
     note: text(item.note),
     createdFrom: text(item.createdFrom),
   }));
@@ -844,6 +916,7 @@ function render() {
     stock: renderStockCollection,
     packaging: renderPackagingCollection,
     equipment: renderEquipmentCollection,
+    review: renderReview,
     archive: renderArchive,
   };
 
@@ -923,6 +996,8 @@ function renderProfessionalDashboard() {
       </div>
     </section>
 
+    ${renderQuickCapturePanel()}
+
     <div class="home-focus-grid">
       <section class="panel queue-panel">
         <div class="panel-header">
@@ -968,6 +1043,8 @@ function renderProfessionalDashboard() {
       </section>
     </div>
 
+    ${renderReviewSnapshot()}
+
     <section class="panel workflow-panel">
       <div class="panel-header">
         <div class="panel-title">
@@ -979,6 +1056,184 @@ function renderProfessionalDashboard() {
       <div class="workflow open-workflow">${openWorkflow(stats)}</div>
     </section>
   `;
+}
+
+function renderQuickCapturePanel() {
+  const recent = sortRolls(app.state.rolls)[0];
+  const templates = app.state.workflow.templates.slice(0, 6);
+  return `
+    <section class="panel quick-capture-panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <p class="section-eyebrow">Entrada rápida</p>
+          <h3>Começar em poucos toques</h3>
+          <span class="panel-subtitle">Repete o último conjunto ou usa um modelo pessoal</span>
+        </div>
+        <button class="button primary compact-button" type="button" data-action="new-roll">${uiIcon("plus")}<span>Novo vazio</span></button>
+      </div>
+      <div class="quick-capture-actions">
+        ${recent ? `<button type="button" data-action="repeat-last-roll" data-id="${escapeAttr(recent.id)}">${uiIcon("repeat-2")}<span><strong>Repetir último</strong><small>${escapeHtml(recent.camera || "Sem câmara")} · ${escapeHtml(filmName(recent) || "Sem filme")}</small></span></button>` : ""}
+        ${templates.map((template) => `<span class="template-action"><button type="button" data-action="new-roll-template" data-id="${escapeAttr(template.id)}">${uiIcon("layout-template")}<span><strong>${escapeHtml(template.name)}</strong><small>${escapeHtml(template.capture.camera || "Sem câmara")} · ${escapeHtml(`${template.capture.filmBrand} ${template.capture.filmModel}`.trim() || "Sem filme")}</small></span></button><button class="template-delete" type="button" data-action="delete-roll-template" data-id="${escapeAttr(template.id)}" aria-label="Eliminar modelo ${escapeAttr(template.name)}" title="Eliminar modelo">${uiIcon("x")}</button></span>`).join("")}
+        ${!recent && !templates.length ? '<span class="empty-state compact">Os modelos pessoais aparecerão aqui depois de guardares um rolo semelhante.</span>' : ""}
+      </div>
+    </section>
+  `;
+}
+
+function getArchiveReview() {
+  const now = new Date();
+  const expiryLimit = new Date(now);
+  expiryLimit.setDate(expiryLimit.getDate() + 180);
+  const open = sortRolls(app.state.rolls.filter((roll) => roll.status !== "Arquivado"));
+  const archive = sortRolls(app.state.rolls.filter((roll) => roll.status === "Arquivado" && !text(roll.archiveLocation)));
+  const identity = sortRolls(app.state.rolls.filter((roll) => (
+    !text(roll.camera)
+    || !text(roll.filmBrand)
+    || !text(roll.filmModel)
+    || numberOrZero(roll.iso) <= 0
+  )));
+  const stock = [...app.state.stock]
+    .filter((item) => {
+      if (numberOrZero(item.quantity) <= 0 || !text(item.expiryDate)) return false;
+      const expiry = new Date(`${item.expiryDate}T12:00:00`);
+      return !Number.isNaN(expiry.getTime()) && expiry <= expiryLimit;
+    })
+    .sort((a, b) => String(a.expiryDate || "").localeCompare(String(b.expiryDate || "")));
+  const favorites = sortRolls(app.state.rolls.filter((roll) => roll.favorite));
+  return { open, archive, identity, stock, favorites };
+}
+
+function renderReviewSnapshot() {
+  const review = getArchiveReview();
+  return `
+    <section class="panel review-snapshot">
+      <div class="panel-header">
+        <div class="panel-title">
+          <p class="section-eyebrow">Revisão inteligente</p>
+          <h3>O arquivo em quatro sinais</h3>
+          <span class="panel-subtitle">Atalhos para o que pode precisar de uma decisão</span>
+        </div>
+        <button class="text-button" type="button" data-action="open-review" data-review="all">Abrir revisão ${uiIcon("arrow-right")}</button>
+      </div>
+      <div class="review-metrics">
+        ${reviewMetric("Em andamento", review.open.length, "activity", "open")}
+        ${reviewMetric("Sem arquivo físico", review.archive.length, "folder-question", "archive")}
+        ${reviewMetric("Identificação incompleta", review.identity.length, "scan-search", "identity")}
+        ${reviewMetric("Stock a verificar", review.stock.length, "calendar-clock", "stock")}
+      </div>
+      ${review.favorites.length ? `<button class="favorite-shortcut" type="button" data-action="open-review" data-review="favorites">${uiIcon("star")}<span><strong>${formatNumber(review.favorites.length)} favoritos</strong><small>Acesso direto aos rolos marcados</small></span>${uiIcon("chevron-right")}</button>` : ""}
+    </section>
+  `;
+}
+
+function reviewMetric(label, count, icon, filter) {
+  return `
+    <button type="button" data-action="open-review" data-review="${escapeAttr(filter)}">
+      <span>${uiIcon(icon)}${escapeHtml(label)}</span>
+      <strong>${formatNumber(count)}</strong>
+      <small>${count ? "abrir lista" : "sem pendências"}</small>
+    </button>
+  `;
+}
+
+function renderReview() {
+  const review = getArchiveReview();
+  const categories = reviewCategories(review);
+  const active = app.reviewFilter || "all";
+  const activeCategory = categories.find((category) => category.key === active);
+  const issueTotal = review.open.length + review.archive.length + review.identity.length + review.stock.length;
+
+  return `
+    <section class="review-hero">
+      <div>
+        <p class="section-eyebrow">Centro de revisão</p>
+        <h2>${issueTotal ? `${formatNumber(issueTotal)} sinais para rever` : "Arquivo em dia"}</h2>
+        <p>Esta página não altera nada sozinha. Apenas reúne registos que podem merecer atenção.</p>
+      </div>
+      <button class="button secondary" type="button" data-action="go-view" data-view="dashboard">${uiIcon("arrow-left")}<span>Voltar à entrada</span></button>
+    </section>
+
+    <div class="review-tabs" role="tablist" aria-label="Tipo de revisão">
+      <button type="button" role="tab" data-action="set-review-filter" data-review="all" aria-selected="${active === "all"}" class="${active === "all" ? "active" : ""}">Tudo <span>${formatNumber(issueTotal)}</span></button>
+      ${categories.map((category) => `<button type="button" role="tab" data-action="set-review-filter" data-review="${category.key}" aria-selected="${active === category.key}" class="${active === category.key ? "active" : ""}">${escapeHtml(category.shortLabel)} <span>${formatNumber(category.items.length)}</span></button>`).join("")}
+    </div>
+
+    <div class="review-sections">
+      ${activeCategory
+        ? renderReviewSection(activeCategory, false)
+        : categories.filter((category) => category.key !== "favorites" || category.items.length).map((category) => renderReviewSection(category, true)).join("")}
+    </div>
+  `;
+}
+
+function reviewCategories(review) {
+  return [
+    { key: "open", shortLabel: "Em andamento", title: "Rolos em andamento", description: "O fluxo ainda não chegou a Arquivado.", icon: "activity", items: review.open, kind: "roll", reason: (roll) => `${roll.status || "Sem estado"} · ${formatDate(roll.date)}` },
+    { key: "archive", shortLabel: "Arquivo", title: "Sem arquivo físico", description: "Rolos arquivados sem localização física registada.", icon: "folder-question", items: review.archive, kind: "roll", reason: () => "Local de arquivo por preencher" },
+    { key: "identity", shortLabel: "Identificação", title: "Identificação incompleta", description: "Falta câmara, filme, modelo ou ISO.", icon: "scan-search", items: review.identity, kind: "roll", reason: missingIdentityLabel },
+    { key: "stock", shortLabel: "Stock", title: "Stock a verificar", description: "Filmes expirados ou a chegar aos próximos seis meses.", icon: "calendar-clock", items: review.stock, kind: "stock", reason: stockExpiryLabel },
+    { key: "favorites", shortLabel: "Favoritos", title: "Rolos favoritos", description: "Os registos que decidiste manter à mão.", icon: "star", items: review.favorites, kind: "roll", reason: (roll) => `${filmName(roll) || "Sem filme"} · ${formatDate(roll.date)}` },
+  ];
+}
+
+function renderReviewSection(category, compact) {
+  const items = compact ? category.items.slice(0, 6) : category.items;
+  return `
+    <section class="panel review-section">
+      <div class="panel-header">
+        <div class="panel-title">
+          <p class="section-eyebrow">${uiIcon(category.icon)}${escapeHtml(category.shortLabel)}</p>
+          <h3>${escapeHtml(category.title)}</h3>
+          <span class="panel-subtitle">${escapeHtml(category.description)}</span>
+        </div>
+        ${compact && category.items.length > items.length ? `<button class="text-button" type="button" data-action="set-review-filter" data-review="${category.key}">Ver ${formatNumber(category.items.length)} ${uiIcon("arrow-right")}</button>` : ""}
+      </div>
+      ${items.length ? `<div class="review-list">${items.map((item) => category.kind === "stock" ? reviewStockRow(item, category.reason(item)) : reviewRollRow(item, category.reason(item))).join("")}</div>` : emptyState("Nada para rever nesta categoria.")}
+    </section>
+  `;
+}
+
+function reviewRollRow(roll, reason) {
+  return `
+    <article class="review-row">
+      <button class="review-row-main" type="button" data-action="view-roll" data-id="${escapeAttr(roll.id)}">
+        <span class="review-row-icon">${uiIcon("film")}</span>
+        <span><strong>${escapeHtml(roll.id)} · ${escapeHtml(roll.camera || "Sem câmara")}</strong><small>${escapeHtml(reason)}</small></span>
+      </button>
+      <button class="favorite-toggle ${roll.favorite ? "active" : ""}" type="button" data-action="toggle-favorite" data-id="${escapeAttr(roll.id)}" aria-label="${roll.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}" title="${roll.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}">${uiIcon("star")}</button>
+      <button class="icon-button subtle" type="button" data-action="edit-roll" data-id="${escapeAttr(roll.id)}" aria-label="Editar rolo" title="Editar rolo">${uiIcon("pencil")}</button>
+    </article>
+  `;
+}
+
+function reviewStockRow(item, reason) {
+  return `
+    <article class="review-row">
+      <button class="review-row-main" type="button" data-action="edit-stock" data-id="${escapeAttr(item.id)}">
+        <span class="review-row-icon">${uiIcon("package")}</span>
+        <span><strong>${escapeHtml(item.brand)} ${escapeHtml(item.model)} · ISO ${escapeHtml(item.iso)}</strong><small>${escapeHtml(reason)} · ${formatInStockCount(numberOrZero(item.quantity))}</small></span>
+      </button>
+      <button class="button primary compact-button" type="button" data-action="new-roll-from-stock" data-id="${escapeAttr(item.id)}" ${numberOrZero(item.quantity) > 0 ? "" : "disabled"}>${uiIcon("circle-plus")}<span>Carregar</span></button>
+    </article>
+  `;
+}
+
+function missingIdentityLabel(roll) {
+  const missing = [];
+  if (!text(roll.camera)) missing.push("câmara");
+  if (!text(roll.filmBrand)) missing.push("marca");
+  if (!text(roll.filmModel)) missing.push("modelo");
+  if (numberOrZero(roll.iso) <= 0) missing.push("ISO");
+  return `Falta: ${missing.join(", ")}`;
+}
+
+function stockExpiryLabel(item) {
+  const expiry = new Date(`${item.expiryDate}T12:00:00`);
+  const today = new Date();
+  const days = Math.ceil((expiry - today) / 86400000);
+  if (days < 0) return `Expirou em ${formatDate(item.expiryDate)}`;
+  if (days === 0) return "Expira hoje";
+  return `Expira em ${formatNumber(days)} dias · ${formatDate(item.expiryDate)}`;
 }
 
 function renderPrivateInitialization() {
@@ -998,7 +1253,7 @@ function renderPrivateInitialization() {
         <button class="button secondary" type="button" data-action="cloud-pull">Verificar backup existente</button>
       </div>
       <ol>
-        <li>Escolhe <strong>BACKUP_INICIAL_ROLOS-v1.11-326-ROLOS.json</strong>.</li>
+        <li>Escolhe <strong>BACKUP_INICIAL_ROLOS-v2.1-326-ROLOS.json</strong>.</li>
         <li>Confirma que aparecem 326 rolos.</li>
         <li>Vai a <strong>Backup</strong> e aguarda a confirmação da sincronização.</li>
       </ol>
@@ -1132,6 +1387,9 @@ function renderDashboard() {
 function renderStats() {
   const statsRolls = getStatsRolls();
   const stats = getStats(statsRolls);
+  const finances = financialSummary(statsRolls, app.state.stock);
+  const durations = processingDurationSummary(statsRolls);
+  const forecast = stockForecast(app.state.stock, app.state.rolls);
   return `
     ${statsFilterToolbar(statsRolls.length)}
 
@@ -1148,6 +1406,8 @@ function renderStats() {
     </section>
 
     ${patternInsights(stats)}
+
+    ${renderV25OperationalInsights(stats, finances, durations, forecast)}
 
     <section class="panel">
       <div class="panel-header">
@@ -1237,6 +1497,53 @@ function renderStats() {
   `;
 }
 
+function renderV25OperationalInsights(stats, finances, durations, forecast) {
+  const completionRate = stats.totalRolls ? Math.round((stats.archivedRolls / stats.totalRolls) * 100) : 0;
+  const byProject = countBy(getStatsRolls(), (roll) => roll.project || "Sem projeto");
+  return `
+    <section class="panel v25-insights-panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <p class="section-eyebrow">Operação v2.5</p>
+          <h3>Custos, tempos e previsão</h3>
+          <span class="panel-subtitle">Os registos antigos continuam válidos; as médias usam apenas os campos preenchidos</span>
+        </div>
+      </div>
+      <div class="v25-metric-grid">
+        ${metric("Custo registado", formatCurrency(finances.total), `${formatNumber(finances.trackedRolls)} rolos com custos`)}
+        ${metric("Custo médio", formatCurrency(finances.average), "por rolo com custos")}
+        ${metric("Valor do stock", formatCurrency(finances.stockValue), `${formatNumber(forecast.totalStock)} rolos disponíveis`)}
+        ${metric("Arquivo concluído", `${formatNumber(completionRate)}%`, `${formatNumber(stats.archivedRolls)} arquivados`)}
+      </div>
+      <div class="v25-duration-grid">
+        ${durationMetric("Disparo → revelação", durations.shotToDevelop)}
+        ${durationMetric("Revelação → digitalização", durations.developToScan)}
+        ${durationMetric("Digitalização → arquivo", durations.scanToArchive)}
+        ${durationMetric("Autonomia de stock", { tracked: 12, averageDays: forecast.monthsRemaining == null ? null : Math.round(forecast.monthsRemaining * 30.4) }, true)}
+      </div>
+      <div class="dashboard-grid">
+        <div>
+          <h4>Custos por ano</h4>
+          ${finances.byYear.size ? barChart(finances.byYear, { maxItems: 8 }) : emptyState("Preenche custos nos rolos para iniciar esta análise.")}
+        </div>
+        <div>
+          <h4>Projetos e viagens</h4>
+          ${barChart(byProject, { maxItems: 8, alt: true })}
+        </div>
+      </div>
+      <div class="stock-forecast-summary">
+        <span>${uiIcon("package-search")}<span><strong>${forecast.monthsRemaining == null ? "Autonomia por calcular" : `${formatNumber(forecast.monthsRemaining)} meses de stock`}</strong><small>Consumo médio dos últimos 12 meses: ${formatNumber(Math.round(forecast.monthlyUse * 10) / 10)} rolos/mês</small></span></span>
+        <span>${uiIcon(forecast.expired.length ? "triangle-alert" : "calendar-check")}<span><strong>${formatNumber(forecast.expired.length)} referências expiradas</strong><small>${formatNumber(forecast.expiring.length)} a expirar nos próximos seis meses</small></span></span>
+      </div>
+    </section>
+  `;
+}
+
+function durationMetric(label, result, months = false) {
+  const value = result.averageDays == null ? "—" : months ? `${formatNumber(Math.round((result.averageDays / 30.4) * 10) / 10)} meses` : `${formatNumber(result.averageDays)} dias`;
+  return `<span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(label)}${!months ? ` · ${formatNumber(result.tracked)} registos` : ""}</small></span>`;
+}
+
 function statsFilterToolbar(resultCount) {
   const cameras = unique(app.state.rolls.map((roll) => roll.camera)).sort(localeSort);
   const films = unique(app.state.rolls.map(filmName)).sort(localeSort);
@@ -1285,10 +1592,13 @@ function renderRollCollection() {
       ${filterSelect("rollsType", "Tipo", ["", ...unique(app.state.rolls.map((roll) => roll.type)).sort(localeSort)])}
       <div class="toolbar-actions">
         <button class="button ${app.filters.rollsStatus === "__open" ? "primary" : "secondary"}" type="button" data-action="show-open-rolls">${uiIcon("activity")}<span>Em andamento</span></button>
+        <button class="button ${app.filters.rollsFavorite === "only" ? "primary" : "secondary"}" type="button" data-action="show-favorites">${uiIcon("star")}<span>Favoritos</span></button>
         <button class="button secondary" type="button" data-action="clear-roll-filters">${uiIcon("filter-x")}<span>Limpar</span></button>
         <button class="button primary" type="button" data-action="new-roll">${uiIcon("plus")}<span>Novo rolo</span></button>
       </div>
     </section>
+
+    ${renderPhysicalArchivePanel()}
 
     ${collectionHeading({
       collection: "rolls",
@@ -1310,6 +1620,174 @@ function renderRollCollection() {
 
     ${collectionPagination(rolls.length, visibleRolls.length)}
   `;
+}
+
+function renderPhysicalArchivePanel() {
+  const query = normalizeSearchValue(app.physicalSearch);
+  const candidates = sortRolls(app.state.rolls)
+    .filter((roll) => !query || commandRollText(roll).includes(query))
+    .slice(0, 80);
+  const selectedCount = app.physicalSelection.size;
+  const incomplete = app.state.rolls.filter((roll) => roll.status === "Arquivado"
+    && (!roll.archiveLocation || !roll.negativePresent || !roll.scanFilesPresent));
+  return `
+    <details class="panel physical-archive-panel">
+      <summary>
+        <span>${uiIcon("archive")}<span><strong>Arquivo físico e etiquetas</strong><small>${formatNumber(incomplete.length)} por confirmar · ${formatNumber(selectedCount)} selecionados</small></span></span>
+        ${uiIcon("chevron-down")}
+      </summary>
+      <div class="physical-archive-content">
+        <div class="physical-toolbar">
+          <label><span>Encontrar rolo</span><input type="search" value="${escapeAttr(app.physicalSearch)}" placeholder="ID, pasta, câmara ou projeto" data-physical-search></label>
+          <div class="toolbar-actions">
+            <button class="button secondary compact-button" type="button" data-action="select-physical-issues">${uiIcon("list-checks")}<span>Selecionar pendentes</span></button>
+            <button class="button secondary compact-button" type="button" data-action="scan-roll-qr">${uiIcon("scan-line")}<span>Ler QR</span></button>
+            <button class="button secondary compact-button" type="button" data-action="print-roll-labels" ${selectedCount ? "" : "disabled"}>${uiIcon("printer")}<span>Etiquetas</span></button>
+          </div>
+        </div>
+        <div class="physical-roll-list">
+          ${candidates.map((roll) => `<label class="physical-roll-row ${app.physicalSelection.has(roll.id) ? "selected" : ""}"><input type="checkbox" data-physical-select value="${escapeAttr(roll.id)}" ${app.physicalSelection.has(roll.id) ? "checked" : ""}><span><strong>${escapeHtml(roll.id)} · ${escapeHtml(roll.camera || "Sem câmara")}</strong><small>${escapeHtml(roll.archiveLocation || "Sem localização")} · ${escapeHtml(physicalArchiveSummary(roll))}</small></span>${statusPill(roll.status)}</label>`).join("")}
+        </div>
+        <div class="physical-batch-actions">
+          <button class="button secondary" type="button" data-action="batch-archive-location" ${selectedCount ? "" : "disabled"}>Definir localização</button>
+          <button class="button secondary" type="button" data-action="batch-confirm-physical" ${selectedCount ? "" : "disabled"}>Confirmar elementos</button>
+          <button class="button primary" type="button" data-action="batch-mark-archived" ${selectedCount ? "" : "disabled"}>Marcar arquivados</button>
+          <button class="button danger ghost" type="button" data-action="clear-physical-selection" ${selectedCount ? "" : "disabled"}>Limpar seleção</button>
+        </div>
+      </div>
+    </details>
+  `;
+}
+
+function selectPhysicalIssues() {
+  app.physicalSelection = new Set(app.state.rolls
+    .filter((roll) => roll.status === "Arquivado" && (!roll.archiveLocation || !roll.negativePresent || !roll.scanFilesPresent))
+    .map((roll) => roll.id));
+  render();
+  const panel = root.querySelector(".physical-archive-panel");
+  if (panel) panel.open = true;
+}
+
+function applyPhysicalBatch(mode) {
+  const selectedIds = [...app.physicalSelection];
+  if (!selectedIds.length) return;
+  let changes = {};
+  let detail = "";
+  if (mode === "location") {
+    const location = prompt(uiText("Nova localização física para os rolos selecionados:"), "");
+    if (!text(location)) return;
+    changes = { archiveLocation: text(location) };
+    detail = `Localização: ${text(location)}`;
+  } else if (mode === "confirm") {
+    changes = { negativePresent: true, contactSheetPresent: true, scanFilesPresent: true };
+    detail = "Negativos, folhas de contacto e digitalizações confirmados";
+  } else if (mode === "archive") {
+    if (!confirm(uiText(`Marcar ${selectedIds.length} rolos como arquivados?`))) return;
+    changes = { status: "Arquivado" };
+    detail = "Estado alterado para Arquivado";
+  } else {
+    return;
+  }
+  rememberUndo();
+  const result = applyBatchArchiveUpdate(app.state.rolls, selectedIds, changes);
+  app.state.rolls = result.rolls;
+  addArchiveActivity(mode, selectedIds, detail);
+  app.state = normalizeState(app.state);
+  persistState();
+  app.physicalSelection.clear();
+  render();
+  showToast(`${result.updated} ${result.updated === 1 ? "rolo atualizado" : "rolos atualizados"}.`, { undo: true });
+}
+
+function addArchiveActivity(action, rollIds, detail) {
+  const timestamp = new Date().toISOString();
+  app.state.workflow.archiveActivity.push({
+    id: `archive-${timestamp.replace(/\D/g, "").slice(0, 17)}-${createId("log").slice(-6)}`,
+    at: timestamp,
+    action,
+    rollIds: [...rollIds],
+    detail,
+  });
+  app.state.workflow.archiveActivity = app.state.workflow.archiveActivity.slice(-200);
+}
+
+function printSelectedRollLabels() {
+  const selected = sortRolls(app.state.rolls.filter((roll) => app.physicalSelection.has(roll.id)));
+  if (!selected.length) return;
+  const labels = selected.map((roll) => `
+    <article class="label">
+      <div class="qr">${qrSvgForRollId(roll.id, { scale: 5 })}</div>
+      <div><strong>${escapeHtml(roll.id)}</strong><span>${escapeHtml(roll.camera || "Sem câmara")}</span><span>${escapeHtml(filmName(roll) || "Sem filme")}</span><small>${escapeHtml(roll.archiveLocation || "Local por definir")}</small></div>
+    </article>
+  `).join("");
+  const printWindow = window.open("", "rolos-labels", "width=900,height=700");
+  if (!printWindow) {
+    showToast("O navegador bloqueou a janela de etiquetas.");
+    return;
+  }
+  printWindow.document.write(`<!doctype html><html lang="pt"><head><meta charset="utf-8"><title>Etiquetas Rolos</title><style>@page{margin:10mm}body{font-family:Arial,sans-serif;margin:0}.sheet{display:grid;grid-template-columns:repeat(3,1fr);gap:6mm}.label{display:grid;grid-template-columns:30mm 1fr;gap:4mm;align-items:center;border:1px solid #bbb;border-radius:3mm;padding:4mm;break-inside:avoid}.qr svg{display:block;width:30mm;height:30mm}.label div:last-child{display:grid;gap:1.5mm}.label strong{font-size:16pt}.label span{font-size:9pt}.label small{font-size:8pt;color:#555}@media print{button{display:none}}</style></head><body><button onclick="window.print()">Imprimir</button><main class="sheet">${labels}</main></body></html>`);
+  printWindow.document.close();
+  printWindow.focus();
+}
+
+async function openRollQrScanner() {
+  if (!("BarcodeDetector" in window) || !navigator.mediaDevices?.getUserMedia) {
+    const manual = prompt(uiText("A leitura QR não está disponível neste navegador. Introduz o ID do rolo:"), "");
+    if (manual) openScannedRoll(manual);
+    return;
+  }
+  const scannerDialog = document.createElement("dialog");
+  scannerDialog.className = "scanner-dialog";
+  scannerDialog.innerHTML = `<div class="scanner-surface"><div><p class="kicker">Arquivo físico</p><h2>Ler etiqueta QR</h2></div><video autoplay playsinline muted></video><p>Aponta a câmara para a etiqueta do rolo.</p><button class="button secondary" type="button">Cancelar</button></div>`;
+  document.body.appendChild(scannerDialog);
+  const video = scannerDialog.querySelector("video");
+  let stream;
+  let stopped = false;
+  const close = () => {
+    stopped = true;
+    stream?.getTracks().forEach((track) => track.stop());
+    if (scannerDialog.open) scannerDialog.close();
+    scannerDialog.remove();
+  };
+  scannerDialog.querySelector("button").addEventListener("click", close);
+  scannerDialog.addEventListener("cancel", (event) => { event.preventDefault(); close(); });
+  scannerDialog.showModal();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+    video.srcObject = stream;
+    const detector = new window.BarcodeDetector({ formats: ["qr_code"] });
+    const scan = async () => {
+      if (stopped) return;
+      try {
+        const codes = await detector.detect(video);
+        if (codes.length) {
+          const value = codes[0].rawValue;
+          close();
+          openScannedRoll(value);
+          return;
+        }
+      } catch {
+        // A câmara pode ainda estar a iniciar; volta a tentar no fotograma seguinte.
+      }
+      window.setTimeout(scan, 180);
+    };
+    scan();
+  } catch (error) {
+    console.error(error);
+    close();
+    const manual = prompt(uiText("Não foi possível abrir a câmara. Introduz o ID do rolo:"), "");
+    if (manual) openScannedRoll(manual);
+  }
+}
+
+function openScannedRoll(value) {
+  const match = /\d{8}/.exec(text(value));
+  const id = match?.[0] || "";
+  if (!id || !findItem("roll", id)) {
+    showToast("Não foi encontrado um rolo correspondente a esse QR.");
+    return;
+  }
+  openDetails(id);
 }
 
 function renderStockCollection() {
@@ -1749,7 +2227,7 @@ function rollCatalogCard(roll) {
           <span>${escapeHtml(formatDate(roll.date) || "Sem data")}</span>
         </div>
         <div class="catalog-card-flags">
-          ${roll.favorite ? `<span class="favorite-flag" title="Favorito">${uiIcon("star")}</span>` : ""}
+          <button class="favorite-toggle ${roll.favorite ? "active" : ""}" type="button" data-action="toggle-favorite" data-id="${escapeAttr(roll.id)}" aria-label="${roll.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}" title="${roll.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}">${uiIcon("star")}</button>
           ${statusPill(roll.status)}
         </div>
       </header>
@@ -1825,6 +2303,7 @@ function stockCatalogCard(item) {
           <span><small>ISO</small><strong>${escapeHtml(item.iso || "—")}</strong></span>
           <span><small>Tipo</small><strong>${escapeHtml(item.type || "—")}</strong></span>
           <span><small>Quantidade</small><strong>${formatNumber(item.quantity)}</strong></span>
+          <span><small>Custo/unidade</small><strong>${item.unitCost ? formatCurrency(item.unitCost) : "—"}</strong></span>
         </div>
         <div class="stock-card-note">
           ${uiIcon("calendar-clock")}
@@ -1885,7 +2364,7 @@ function rollListView(rolls) {
       <td>${escapeHtml(roll.id)}</td><td>${statusPill(roll.status)}</td><td>${formatDate(roll.date)}</td>
       <td>${escapeHtml(roll.camera)}</td><td>${escapeHtml(filmName(roll))}</td><td>${escapeHtml(roll.iso)}</td>
       <td>${escapeHtml(roll.format)}</td><td>${escapeHtml(roll.shotLocation)}</td><td>${photosLink(roll)}</td>
-      <td class="table-actions"><button class="button secondary compact-button" type="button" data-action="view-roll" data-id="${escapeAttr(roll.id)}">${uiIcon("eye")}<span>Ver</span></button>${statusAdvanceButton(roll, true)}</td>
+      <td class="table-actions"><button class="favorite-toggle ${roll.favorite ? "active" : ""}" type="button" data-action="toggle-favorite" data-id="${escapeAttr(roll.id)}" aria-label="${roll.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}" title="${roll.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}">${uiIcon("star")}</button><button class="button secondary compact-button" type="button" data-action="view-roll" data-id="${escapeAttr(roll.id)}">${uiIcon("eye")}<span>Ver</span></button>${statusAdvanceButton(roll, true)}</td>
     </tr>
   `).join("");
   return `<section class="panel collection-list-panel"><div class="list-table"><table class="rolls-table"><thead><tr><th>ID</th><th>Estado</th><th>Data</th><th>Câmara</th><th>Filme</th><th>ISO</th><th>Formato</th><th>Local</th><th>Fotos</th><th class="table-actions">Ação</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
@@ -2147,6 +2626,7 @@ function renderEquipment() {
 function renderArchive() {
   const stats = getStats();
   const automaticBackup = Boolean(app.state.meta.autoCloudBackup);
+  const replacementPending = isImportedReplacementPending();
   const lastCloudBackup = formatDateTime(app.state.meta.lastCloudBackupAt);
   const automaticBackupDetail = automaticBackup
     ? (lastCloudBackup ? `Última sincronização: ${escapeHtml(lastCloudBackup)}` : "Verifica e guarda cada alteração automaticamente")
@@ -2177,6 +2657,16 @@ function renderArchive() {
           </div>
         </div>
         <input class="file-input" type="file" accept="application/json,.json" data-action="import-json-file">
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <h3>Testar um backup</h3>
+            <span class="panel-subtitle">Valida o JSON sem alterar os dados atuais</span>
+          </div>
+        </div>
+        <input class="file-input" type="file" accept="application/json,.json" data-action="verify-json-file">
       </section>
 
       <section class="panel">
@@ -2214,6 +2704,16 @@ function renderArchive() {
           </div>
         </div>
         <div class="sync-box">
+          ${replacementPending ? `
+            <div class="cloud-replacement-notice">
+              <span>${uiIcon("shield-alert")}</span>
+              <span>
+                <strong>Base importada pronta para um novo início</strong>
+                <small>A cópia está segura neste dispositivo. Ao confirmar, esta base passa a versão 1 e o arquivo atual, o historial e as cópias de recuperação anteriores no Firebase são eliminados.</small>
+              </span>
+              <button class="button danger" type="button" data-action="reset-cloud-from-current">Começar do zero online</button>
+            </div>
+          ` : ""}
           <button class="auto-backup-toggle ${automaticBackup ? "active" : ""}" type="button" data-action="toggle-auto-backup" aria-pressed="${automaticBackup}">
             <span class="auto-backup-icon">${uiIcon(automaticBackup ? "cloud-check" : "cloud")}</span>
             <span>
@@ -2226,12 +2726,14 @@ function renderArchive() {
           <div class="backup-actions">
             <button class="button secondary" type="button" data-action="cloud-connect">Ligar</button>
             <button class="button secondary" type="button" data-action="cloud-signin">Entrar</button>
-            <button class="button primary" type="button" data-action="cloud-push">Sincronizar agora</button>
-            <button class="button secondary" type="button" data-action="cloud-pull">Verificar versão online</button>
+            <button class="button primary" type="button" data-action="${replacementPending ? "reset-cloud-from-current" : "cloud-push"}">${replacementPending ? "Usar a base importada" : "Sincronizar agora"}</button>
+            <button class="button secondary" type="button" data-action="cloud-pull" ${replacementPending ? "disabled" : ""}>Verificar versão online</button>
             <button class="button secondary" type="button" data-action="cloud-signout">Sair</button>
           </div>
         </div>
       </section>
+
+      ${renderArchiveIntegrityPanel()}
 
       ${renderDriveBackupPanel()}
 
@@ -2259,6 +2761,47 @@ function archiveSummaryRow(label, value) {
   `;
 }
 
+function renderArchiveIntegrityPanel() {
+  const report = archiveIntegrityReport(app.state);
+  const devices = app.cloud.devices || [];
+  const lastCheck = text(app.state.workflow.lastIntegrityCheckAt);
+  return `
+    <section class="panel integrity-panel ${report.ok ? "ok" : "warning"}">
+      <div class="panel-header">
+        <div class="panel-title">
+          <h3>Confiança nos dados</h3>
+          <span class="panel-subtitle">${lastCheck ? `Última verificação: ${escapeHtml(formatDateTime(lastCheck))}` : "Verificação local pronta a executar"}</span>
+        </div>
+        <button class="button ${report.ok ? "secondary" : "primary"} compact-button" type="button" data-action="run-integrity-check">${uiIcon("shield-check")}<span>Verificar agora</span></button>
+      </div>
+      <div class="integrity-grid">
+        ${integrityMetric("IDs duplicados", report.duplicateIds.length, report.duplicateIds.length === 0)}
+        ${integrityMetric("IDs inválidos", report.invalidIds.length, report.invalidIds.length === 0)}
+        ${integrityMetric("Datas incompatíveis", report.dateMismatches.length, report.dateMismatches.length === 0)}
+        ${integrityMetric("Sem arquivo físico", report.missingArchive.length, report.missingArchive.length === 0)}
+      </div>
+      <div class="device-sync-list">
+        <strong>Dispositivos conhecidos</strong>
+        ${devices.length ? devices.map((device) => `<span>${uiIcon(device.id === getDeviceId() ? "monitor-check" : "smartphone")}<span><strong>${escapeHtml(device.label || "Dispositivo")}</strong><small>${escapeHtml(formatDateTime(device.lastSeenAt))} · v${escapeHtml(device.releaseVersion || "?")} · revisão ${formatNumber(device.revision)}</small></span></span>`).join("") : '<small>A lista aparece depois da primeira sincronização da v2.5.</small>'}
+      </div>
+    </section>
+  `;
+}
+
+function integrityMetric(label, value, ok) {
+  return `<span class="integrity-metric ${ok ? "ok" : "warning"}">${uiIcon(ok ? "circle-check" : "triangle-alert")}<span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(label)}</small></span></span>`;
+}
+
+function runIntegrityCheck() {
+  const report = archiveIntegrityReport(app.state);
+  app.state.workflow.lastIntegrityCheckAt = new Date().toISOString();
+  persistState();
+  render();
+  showToast(report.ok
+    ? `Arquivo coerente: ${report.rolls} rolos, sem IDs duplicados nem datas incompatíveis.`
+    : `Foram encontrados ${report.duplicateIds.length + report.invalidIds.length + report.dateMismatches.length + report.negativeStock.length} problemas de integridade.`);
+}
+
 function renderDriveBackupPanel() {
   const status = app.cloud.driveStatus || {};
   const lastBackupAt = text(status.lastBackupAt);
@@ -2270,7 +2813,7 @@ function renderDriveBackupPanel() {
   const title = error
     ? "A cópia não foi concluída"
     : inProgress
-      ? "A guardar a cópia semanal…"
+      ? "A guardar uma nova cópia…"
       : due
         ? "Cópia semanal por criar"
         : "Cópia externa em dia";
@@ -2286,7 +2829,7 @@ function renderDriveBackupPanel() {
       <div class="panel-header">
         <div class="panel-title">
           <h3>Google Drive</h3>
-          <span class="panel-subtitle">Cópia externa semanal, confirmada por si antes do envio</span>
+          <span class="panel-subtitle">Cada clique cria um ficheiro novo; nenhuma cópia da mesma semana é substituída</span>
         </div>
       </div>
       <div class="drive-backup-layout">
@@ -2300,7 +2843,7 @@ function renderDriveBackupPanel() {
         </div>
         <button class="button ${due || error ? "primary" : "secondary"}" type="button" data-action="drive-backup-now" ${inProgress ? "disabled" : ""}>
           ${uiIcon(inProgress ? "loader-circle" : "hard-drive-upload")}
-          <span>${inProgress ? "A guardar…" : "Criar backup no Drive"}</span>
+          <span>${inProgress ? "A guardar…" : "Criar nova cópia no Drive"}</span>
         </button>
       </div>
     </section>
@@ -2310,6 +2853,8 @@ function renderDriveBackupPanel() {
 function renderCloudHistoryPanel() {
   const weeklyCount = app.cloud.history.filter((item) => item.kind === "weekly").length;
   const recoveryCount = app.cloud.history.filter((item) => item.kind === "recovery").length;
+  const usage = app.cloud.historyUsage;
+  const deleting = app.cloud.historyDeleting;
   let content = "";
 
   if (!app.cloud.user) {
@@ -2324,28 +2869,48 @@ function renderCloudHistoryPanel() {
     content = `
       <div class="backup-history-list">
         ${app.cloud.history.map((item) => `
-          <article class="backup-history-item ${item.kind === "recovery" ? "recovery" : ""}">
-            <div class="backup-history-mark">${uiIcon(item.kind === "weekly" ? "calendar-check" : "shield-check")}</div>
+          <article class="backup-history-item ${item.kind === "recovery" ? "recovery" : ""} ${item.pinned ? "pinned" : ""}">
+            <div class="backup-history-mark">${uiIcon(item.pinned ? "pin" : item.kind === "weekly" ? "calendar-check" : "shield-check")}</div>
             <div class="backup-history-copy">
-              <strong>${escapeHtml(item.kind === "weekly" ? formatIsoWeekKey(item.weekKey) : "Cópia de recuperação")}</strong>
-              <span>${escapeHtml(formatDateTime(item.updatedAtLocal))} · ${formatRollCount(item.rollCount)}</span>
+              <strong>${escapeHtml(item.label || (item.kind === "weekly" ? formatIsoWeekKey(item.weekKey) : "Cópia de recuperação"))}${item.pinned ? " · Protegido" : ""}</strong>
+              <span>${escapeHtml(formatDateTime(item.updatedAtLocal))} · ${formatRollCount(item.rollCount)} · ${formatStorageSize(item.approximateBytes)}</span>
             </div>
-            <button class="button secondary compact-button" type="button" data-action="restore-cloud-version" data-id="${escapeAttr(item.id)}">Repor</button>
+            <div class="backup-history-actions">
+              <button class="button secondary compact-button" type="button" data-action="restore-cloud-version" data-id="${escapeAttr(item.id)}" ${deleting ? "disabled" : ""}>Repor</button>
+              <button class="icon-button subtle" type="button" data-action="name-cloud-version" data-id="${escapeAttr(item.id)}" aria-label="Dar nome" title="Dar nome" ${deleting ? "disabled" : ""}>${uiIcon("pencil-line")}</button>
+              <button class="icon-button subtle ${item.pinned ? "active" : ""}" type="button" data-action="toggle-cloud-pin" data-id="${escapeAttr(item.id)}" aria-label="${item.pinned ? "Desproteger" : "Proteger"}" title="${item.pinned ? "Desproteger" : "Proteger"}" ${deleting ? "disabled" : ""}>${uiIcon(item.pinned ? "pin-off" : "pin")}</button>
+              <button class="button danger ghost compact-button" type="button" data-action="delete-cloud-version" data-id="${escapeAttr(item.id)}" ${deleting || item.pinned ? "disabled" : ""}>Eliminar</button>
+            </div>
           </article>
         `).join("")}
       </div>
     `;
   }
 
+  const storageSummary = usage ? `
+    <div class="cloud-storage-summary">
+      <span>${uiIcon("database")}</span>
+      <span>
+        <strong>Espaço Firebase estimado: ${formatStorageSize(usage.approximateBytes)}</strong>
+        <small>${formatNumber(usage.documentCount)} documentos · ${formatNumber(usage.historyCount)} backups · ${formatNumber(usage.imageCount)} imagens</small>
+        <small>Estimativa dos documentos da aplicação; o valor real do Firebase pode incluir índices.</small>
+      </span>
+    </div>
+  ` : "";
+
   return `
     <section class="panel backup-history-panel">
       <div class="panel-header">
         <div class="panel-title">
-          <h3>Historial automático</h3>
+          <h3>Backups Firebase</h3>
           <span class="panel-subtitle">${formatHistoryCount(weeklyCount, WEEKLY_BACKUP_LIMIT, recoveryCount)}</span>
         </div>
-        <button class="icon-button" type="button" data-action="refresh-cloud-history" title="Atualizar historial" aria-label="Atualizar historial">${uiIcon("refresh-cw")}</button>
+        <div class="backup-history-header-actions">
+          ${app.cloud.history.length ? `<button class="button danger ghost compact-button" type="button" data-action="delete-all-cloud-history" ${deleting ? "disabled" : ""}>${uiIcon("trash-2")}<span>Eliminar não protegidos</span></button>` : ""}
+          <button class="icon-button" type="button" data-action="refresh-cloud-history" title="Atualizar historial" aria-label="Atualizar historial" ${deleting ? "disabled" : ""}>${uiIcon("refresh-cw")}</button>
+        </div>
       </div>
+      ${storageSummary}
       ${content}
     </section>
   `;
@@ -2863,6 +3428,130 @@ function emptyState(message) {
   return `<div class="empty-state">${escapeHtml(message)}</div>`;
 }
 
+function handleGlobalKeydown(event) {
+  const typing = event.target?.matches?.("input, textarea, select, [contenteditable='true']");
+  if ((event.ctrlKey || event.metaKey) && String(event.key).toLowerCase() === "k") {
+    event.preventDefault();
+    openCommandPalette();
+    return;
+  }
+  if (event.key === "/" && !typing && !dialog.open && !commandDialog?.open) {
+    event.preventDefault();
+    openCommandPalette();
+  }
+}
+
+function handleCommandInput(event) {
+  app.commandQuery = event.target.value;
+  renderCommandResults();
+}
+
+function handleCommandKeydown(event) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeCommandPalette();
+    return;
+  }
+  if (event.key !== "Enter") return;
+  const firstResult = commandResults?.querySelector("[data-command-result]");
+  if (!firstResult) return;
+  event.preventDefault();
+  firstResult.click();
+}
+
+function openCommandPalette() {
+  if (!commandDialog || dialog.open) return;
+  if (detailDialog.open) closeDetails();
+  app.commandQuery = "";
+  commandSearch.value = "";
+  renderCommandResults();
+  if (!commandDialog.open) commandDialog.showModal();
+  window.setTimeout(() => commandSearch.focus(), 0);
+  refreshIcons();
+}
+
+function closeCommandPalette() {
+  if (commandDialog?.open) commandDialog.close();
+  app.commandQuery = "";
+}
+
+function renderCommandResults() {
+  if (!commandResults || !app.state) return;
+  const query = normalizeSearchValue(app.commandQuery);
+  if (!query) {
+    commandResults.innerHTML = `
+      <section class="command-section">
+        <h3>Ações rápidas</h3>
+        <div class="command-actions-grid">
+          ${commandAction("plus", "Novo rolo", "new-roll")}
+          ${commandAction("scan-search", "Abrir revisão", "command-go-view", { view: "review" })}
+          ${commandAction("film", "Ver rolos", "command-go-view", { view: "rolls" })}
+          ${commandAction("package", "Ver stock", "command-go-view", { view: "stock" })}
+          ${commandAction("camera", "Ver equipamento", "command-go-view", { view: "equipment" })}
+          ${commandAction("cloud-upload", "Abrir backup", "command-go-view", { view: "archive" })}
+        </div>
+      </section>
+      <p class="command-tip">Também podes começar a escrever um ID, câmara, filme, local ou equipamento.</p>
+    `;
+    refreshIcons();
+    return;
+  }
+
+  const rolls = sortCommandRolls(app.state.rolls.filter((roll) => commandRollText(roll).includes(query))).slice(0, 10);
+  const stock = app.state.stock.filter((item) => commandStockText(item).includes(query)).slice(0, 6);
+  const equipment = app.state.equipment.filter((item) => commandEquipmentText(item).includes(query)).slice(0, 6);
+  commandResults.innerHTML = `
+    ${commandSection("Rolos", rolls.map(commandRollResult))}
+    ${commandSection("Stock", stock.map(commandStockResult))}
+    ${commandSection("Equipamento", equipment.map(commandEquipmentResult))}
+    ${!rolls.length && !stock.length && !equipment.length ? emptyState("Nenhum resultado em todo o arquivo.") : ""}
+  `;
+  refreshIcons();
+}
+
+function commandAction(icon, label, action, data = {}) {
+  const dataAttrs = Object.entries(data).map(([key, value]) => ` data-${escapeAttr(key)}="${escapeAttr(value)}"`).join("");
+  return `<button type="button" data-action="${escapeAttr(action)}" data-command-result${dataAttrs}>${uiIcon(icon)}<span>${escapeHtml(label)}</span></button>`;
+}
+
+function commandSection(label, rows) {
+  if (!rows.length) return "";
+  return `<section class="command-section"><h3>${escapeHtml(label)}</h3><div class="command-list">${rows.join("")}</div></section>`;
+}
+
+function commandRollResult(roll) {
+  return `<button type="button" data-action="command-open-roll" data-id="${escapeAttr(roll.id)}" data-command-result><span class="command-result-icon">${uiIcon(roll.favorite ? "star" : "film")}</span><span><strong>${escapeHtml(roll.id)} · ${escapeHtml(roll.camera || "Sem câmara")}</strong><small>${escapeHtml(filmName(roll) || "Sem filme")} · ${escapeHtml(roll.shotLocation || roll.status || "Sem local")}</small></span>${statusPill(roll.status)}${uiIcon("chevron-right")}</button>`;
+}
+
+function commandStockResult(item) {
+  return `<button type="button" data-action="command-edit-stock" data-id="${escapeAttr(item.id)}" data-command-result><span class="command-result-icon">${uiIcon("package")}</span><span><strong>${escapeHtml(item.brand)} ${escapeHtml(item.model)} · ISO ${escapeHtml(item.iso)}</strong><small>${escapeHtml(item.format)} · ${formatInStockCount(numberOrZero(item.quantity))}</small></span>${uiIcon("chevron-right")}</button>`;
+}
+
+function commandEquipmentResult(item) {
+  return `<button type="button" data-action="command-edit-equipment" data-id="${escapeAttr(item.id)}" data-command-result><span class="command-result-icon">${uiIcon("camera")}</span><span><strong>${escapeHtml(item.brand)} ${escapeHtml(item.model)}</strong><small>${escapeHtml(item.kind)} · ${escapeHtml(item.status)}</small></span>${uiIcon("chevron-right")}</button>`;
+}
+
+function commandRollText(roll) {
+  return normalizeSearchValue([roll.id, roll.negativeCode, roll.camera, roll.lens, roll.filmBrand, roll.filmModel, roll.iso, roll.shotLocation, roll.project, roll.status, roll.notes, roll.archiveLocation].join(" "));
+}
+
+function commandStockText(item) {
+  return normalizeSearchValue([item.brand, item.model, item.iso, item.format, item.type, item.condition, item.expiryDate, item.note].join(" "));
+}
+
+function commandEquipmentText(item) {
+  return normalizeSearchValue([item.kind, item.brand, item.model, item.system, item.status, item.notes].join(" "));
+}
+
+function sortCommandRolls(rolls) {
+  const query = normalizeSearchValue(app.commandQuery);
+  return [...rolls].sort((a, b) => {
+    const aExact = normalizeSearchValue(a.id) === query ? 1 : 0;
+    const bExact = normalizeSearchValue(b.id) === query ? 1 : 0;
+    return bExact - aExact || Number(Boolean(b.favorite)) - Number(Boolean(a.favorite)) || String(b.date || "").localeCompare(String(a.date || ""));
+  });
+}
+
 function handleFilterInput(event) {
   const field = event.target.closest("[data-filter]");
   if (!field) return;
@@ -2900,9 +3589,37 @@ async function handleAction(event) {
   }
 
   if (action === "toggle-language") toggleLanguage();
-  if (action === "new-roll") openEditor("roll");
+  if (action === "open-command") openCommandPalette();
+  if (action === "close-command") closeCommandPalette();
+  if (action === "command-open-roll") {
+    closeCommandPalette();
+    openDetails(id);
+  }
+  if (action === "command-edit-stock") {
+    closeCommandPalette();
+    openEditor("stock", id);
+  }
+  if (action === "command-edit-equipment") {
+    closeCommandPalette();
+    openEditor("equipment", id);
+  }
+  if (action === "command-go-view") {
+    closeCommandPalette();
+    app.activeView = button.dataset.view || "dashboard";
+    render();
+  }
+  if (action === "undo-last-change") undoLastChange();
+  if (action === "new-roll") {
+    if (commandDialog?.open) closeCommandPalette();
+    openEditor("roll");
+  }
   if (action === "new-roll-from-stock") openNewRollFromStock(id);
   if (action === "duplicate-roll") duplicateRoll(id);
+  if (action === "repeat-last-roll") duplicateRoll(id);
+  if (action === "new-roll-template") openRollFromTemplate(id);
+  if (action === "save-roll-template") saveRollAsTemplate(id);
+  if (action === "delete-roll-template") deleteRollTemplate(id);
+  if (action === "dictate-field") startFieldDictation(button.dataset.field);
   if (action === "apply-roll-preset") applyRollPreset(button.dataset.preset, id || button.dataset.value);
   if (action === "set-view-mode") {
     const collection = button.dataset.collection;
@@ -2920,8 +3637,26 @@ async function handleAction(event) {
   if (action === "view-roll") openDetails(id);
   if (action === "edit-roll") openEditor("roll", id);
   if (action === "advance-status") advanceRollStatus(id);
+  if (action === "toggle-favorite") toggleFavorite(id);
+  if (action === "open-review") {
+    app.reviewFilter = button.dataset.review || "all";
+    app.activeView = "review";
+    render();
+  }
+  if (action === "set-review-filter") {
+    app.reviewFilter = button.dataset.review || "all";
+    if (app.activeView !== "review") app.activeView = "review";
+    render();
+  }
   if (action === "show-open-rolls") {
     app.filters.rollsStatus = "__open";
+    app.filters.rollsFavorite = "";
+    app.rollLimit = 50;
+    app.activeView = "rolls";
+    render();
+  }
+  if (action === "show-favorites") {
+    app.filters.rollsFavorite = app.filters.rollsFavorite === "only" ? "" : "only";
     app.rollLimit = 50;
     app.activeView = "rolls";
     render();
@@ -2936,9 +3671,20 @@ async function handleAction(event) {
     app.filters.rollsCamera = "";
     app.filters.rollsFormat = "";
     app.filters.rollsType = "";
+    app.filters.rollsFavorite = "";
     app.rollLimit = 50;
     render();
   }
+  if (action === "select-physical-issues") selectPhysicalIssues();
+  if (action === "clear-physical-selection") {
+    app.physicalSelection.clear();
+    render();
+  }
+  if (action === "batch-archive-location") applyPhysicalBatch("location");
+  if (action === "batch-confirm-physical") applyPhysicalBatch("confirm");
+  if (action === "batch-mark-archived") applyPhysicalBatch("archive");
+  if (action === "print-roll-labels") printSelectedRollLabels();
+  if (action === "scan-roll-qr") await openRollQrScanner();
   if (action === "clear-stats-filters") {
     ["statsCamera", "statsFilm", "statsFormat", "statsType", "statsLocation", "statsStatus", "statsYear"]
       .forEach((name) => { app.filters[name] = ""; });
@@ -2955,6 +3701,7 @@ async function handleAction(event) {
     applyRollFilterShortcut(button.dataset.filter || "all");
     render();
   }
+  if (action === "select-quick-preset-tab") selectQuickPresetTab(button.dataset.preset);
   if (action === "new-stock") openEditor("stock");
   if (action === "edit-stock") openEditor("stock", id);
   if (action === "new-equipment") openEditor("equipment");
@@ -2975,10 +3722,16 @@ async function handleAction(event) {
   if (action === "cloud-signout") await signOutCloud();
   if (action === "cloud-push") await pushCloudBackup();
   if (action === "cloud-pull") await pullCloudBackup();
+  if (action === "reset-cloud-from-current") await resetCloudFromCurrentArchive();
   if (action === "drive-backup-now") await createDriveBackup();
   if (action === "toggle-auto-backup") toggleAutomaticCloudBackup();
   if (action === "refresh-cloud-history") await loadCloudHistory({ force: true });
   if (action === "restore-cloud-version") await restoreCloudVersion(id);
+  if (action === "delete-cloud-version") await deleteCloudHistoryVersion(id);
+  if (action === "delete-all-cloud-history") await deleteAllCloudHistory();
+  if (action === "run-integrity-check") runIntegrityCheck();
+  if (action === "name-cloud-version") await nameCloudHistoryVersion(id);
+  if (action === "toggle-cloud-pin") await toggleCloudHistoryPin(id);
   if (action === "remove-film-image") removeFilmImage(button.dataset.filmKey);
 }
 
@@ -2987,6 +3740,38 @@ root.addEventListener("change", async (event) => {
   if (!input || !input.files?.length) return;
   await importJson(input.files[0]);
   input.value = "";
+});
+
+root.addEventListener("change", async (event) => {
+  const input = event.target.closest('[data-action="verify-json-file"]');
+  if (!input || !input.files?.length) return;
+  await verifyJsonBackup(input.files[0]);
+  input.value = "";
+});
+
+root.addEventListener("change", (event) => {
+  const input = event.target.closest("[data-physical-select]");
+  if (!input) return;
+  if (input.checked) app.physicalSelection.add(input.value);
+  else app.physicalSelection.delete(input.value);
+  render();
+  const panel = root.querySelector(".physical-archive-panel");
+  if (panel) panel.open = true;
+});
+
+root.addEventListener("input", (event) => {
+  const input = event.target.closest("[data-physical-search]");
+  if (!input) return;
+  app.physicalSearch = input.value;
+  const cursor = input.selectionStart;
+  render();
+  const next = root.querySelector("[data-physical-search]");
+  const panel = root.querySelector(".physical-archive-panel");
+  if (panel) panel.open = true;
+  if (next) {
+    next.focus();
+    next.setSelectionRange(cursor, cursor);
+  }
 });
 
 root.addEventListener("change", async (event) => {
@@ -3018,10 +3803,11 @@ async function saveFilmImage(key, file) {
       showToast("O espaço local está quase cheio. Exporta um JSON antes de adicionares mais fotografias.");
       return;
     }
+    rememberUndo();
     app.state.filmImages = nextImages;
     persistState();
     render();
-    showToast("Fotografia da embalagem guardada.");
+    showToast("Fotografia da embalagem guardada.", { undo: true });
   } catch (error) {
     console.error(error);
     showToast(error.message || "Não foi possível preparar esta fotografia.");
@@ -3031,12 +3817,13 @@ async function saveFilmImage(key, file) {
 function removeFilmImage(key) {
   if (!key || !app.state.filmImages[key]) return;
   if (!confirm(uiText("Remover esta fotografia pessoal? A imagem incluída volta a aparecer quando estiver disponível."))) return;
+  rememberUndo();
   const nextImages = { ...app.state.filmImages };
   delete nextImages[key];
   app.state.filmImages = nextImages;
   persistState();
   render();
-  showToast("Fotografia removida.");
+  showToast("Fotografia removida.", { undo: true });
 }
 
 async function createFilmThumbnail(file) {
@@ -3110,6 +3897,7 @@ function openEditor(type, id = null, options = {}) {
   dialogTitle.textContent = id ? editorTitle(type, item) : newEditorTitle(type);
   dialogKicker.textContent = editorKicker(type);
   editorFields.innerHTML = renderEditorFields(type, app.editor.item);
+  if (saveAndAddButton) saveAndAddButton.hidden = !(type === "roll" && !id);
   refreshComputedFields();
   document.querySelector('[data-action="delete-item"]').style.display = id ? "inline-flex" : "none";
   dialog.showModal();
@@ -3134,7 +3922,7 @@ function duplicateRoll(id) {
     showToast("Não encontrei esse rolo.");
     return;
   }
-  closeDetails();
+  if (detailDialog.open) closeDetails();
   openEditor("roll", null, {
     prefill: {
       camera: source.camera,
@@ -3147,6 +3935,45 @@ function duplicateRoll(id) {
       push: source.push,
     },
   });
+}
+
+function openRollFromTemplate(id) {
+  const template = app.state.workflow.templates.find((item) => item.id === id);
+  if (!template) {
+    showToast("Não encontrei esse modelo.");
+    return;
+  }
+  openEditor("roll", null, { prefill: captureFields(template.capture) });
+}
+
+function saveRollAsTemplate(id) {
+  const source = findItem("roll", id);
+  if (!source) {
+    showToast("Não encontrei esse rolo.");
+    return;
+  }
+  const name = prompt(uiText("Nome do modelo pessoal:"), `${source.camera || "Câmara"} · ${source.filmBrand || source.filmModel || "Filme"}`);
+  if (!text(name)) return;
+  try {
+    rememberUndo();
+    const template = captureTemplateFromRoll(name, source);
+    app.state.workflow.templates = [template, ...app.state.workflow.templates.filter((item) => normalizeSearchValue(item.name) !== normalizeSearchValue(template.name))].slice(0, 30);
+    persistState();
+    render();
+    showToast("Modelo pessoal guardado.", { undo: true });
+  } catch (error) {
+    showToast(error.message || "Não foi possível guardar o modelo.");
+  }
+}
+
+function deleteRollTemplate(id) {
+  const template = app.state.workflow.templates.find((item) => item.id === id);
+  if (!template || !confirm(uiText(`Eliminar o modelo ${template.name}?`))) return;
+  rememberUndo();
+  app.state.workflow.templates = app.state.workflow.templates.filter((item) => item.id !== id);
+  persistState();
+  render();
+  showToast("Modelo eliminado.", { undo: true });
 }
 
 function rollCaptureFromStock(stockItem) {
@@ -3171,6 +3998,12 @@ function applyRollPreset(preset, value) {
 
   if (preset === "location") {
     setEditorFieldValue("shotLocation", text(value));
+  }
+
+  if (preset === "template") {
+    const template = app.state.workflow.templates.find((item) => item.id === value);
+    if (!template) return;
+    Object.entries(captureFields(template.capture)).forEach(([name, fieldValue]) => setEditorFieldValue(name, fieldValue));
   }
 
   if (preset === "stock") {
@@ -3228,9 +4061,11 @@ function renderDetails(roll) {
         <span class="detail-subtitle">${escapeHtml(roll.shotLocation || "Sem local")} · ${escapeHtml(roll.folderName)}</span>
       </div>
       <div class="detail-status-block">
+        <button class="favorite-toggle labeled ${roll.favorite ? "active" : ""}" type="button" data-action="toggle-favorite" data-id="${escapeAttr(roll.id)}" aria-label="${roll.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}" title="${roll.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}">${uiIcon("star")}<span>${roll.favorite ? "Favorito" : "Marcar favorito"}</span></button>
         ${statusPill(roll.status)}
         ${next ? `<button class="button primary" type="button" data-action="advance-status" data-id="${escapeAttr(roll.id)}">Avançar</button>` : `<span class="closed-label">Fechado</span>`}
         <button class="button secondary compact-button" type="button" data-action="duplicate-roll" data-id="${escapeAttr(roll.id)}">${uiIcon("copy-plus")}<span>Novo semelhante</span></button>
+        <button class="button secondary compact-button" type="button" data-action="save-roll-template" data-id="${escapeAttr(roll.id)}">${uiIcon("layout-template")}<span>Guardar modelo</span></button>
       </div>
     </section>
 
@@ -3246,11 +4081,18 @@ function renderDetails(roll) {
       ${detailField("Formato", roll.format)}
       ${detailField("Tipo", roll.type)}
       ${detailField("Local disparado", roll.shotLocation, "wide")}
+      ${detailField("Projeto/viagem", roll.project, "wide")}
       ${detailField("Revelado em", roll.developedAt)}
       ${detailField("Digitalizado em", roll.scannedAt)}
       ${detailField("Revelador/método", roll.developerMethod)}
+      ${detailField("Custo total", formatCurrency(rollCost(roll)))}
+      ${detailField("Disparo concluído", formatDate(roll.shotCompletedAt))}
+      ${detailField("Revelação concluída", formatDate(roll.developmentCompletedAt))}
+      ${detailField("Digitalização concluída", formatDate(roll.scanCompletedAt))}
+      ${detailField("Arquivado em", formatDate(roll.archivedAt))}
       ${detailField("Nome da pasta", roll.folderName, "full")}
       ${detailField("Arquivo físico", roll.archiveLocation, "wide")}
+      ${detailField("Elementos físicos", physicalArchiveSummary(roll), "wide")}
       ${detailField("Google Photos", photosDetailLink(roll), "wide", true)}
       ${detailField("Notas", roll.notes, "full")}
     </div>
@@ -3276,11 +4118,28 @@ function advanceDetailStatus() {
   }
 }
 
+function toggleFavorite(id) {
+  const index = app.state.rolls.findIndex((roll) => roll.id === id);
+  if (index < 0) {
+    showToast("Não encontrei esse rolo.");
+    return;
+  }
+  rememberUndo();
+  const favorite = !Boolean(app.state.rolls[index].favorite);
+  app.state.rolls[index] = { ...app.state.rolls[index], favorite };
+  app.state = normalizeState(app.state);
+  persistState();
+  render();
+  if (app.detailId === id && detailDialog.open) renderDetails(findItem("roll", id));
+  showToast(favorite ? "Adicionado aos favoritos." : "Removido dos favoritos.", { undo: true });
+}
+
 function saveEditor(event) {
   event.preventDefault();
   if (!app.editor) return;
   const editorType = app.editor.type;
   const isNewRoll = editorType === "roll" && !app.editor.id;
+  const saveAnother = isNewRoll && event.submitter?.dataset.saveMode === "again";
   const stockItemId = isNewRoll && editorForm.elements.consumeStock?.checked
     ? text(app.editor.stockItemId)
     : "";
@@ -3319,10 +4178,28 @@ function saveEditor(event) {
 
   if (app.editor.type === "roll") {
     values.id = normalizeRollId(values.id);
+    const idCalendar = rollCalendarFromId(values.id);
+    if (!idCalendar.valid) {
+      showToast(`ID inválido: ${idCalendar.reason}`);
+      return;
+    }
+    values.id = idCalendar.id;
+    const duplicateId = app.state.rolls.some((roll) => roll.id === values.id && roll.id !== app.editor.id);
+    if (duplicateId) {
+      showToast(`O ID ${values.id} já existe. O rolo não foi guardado.`);
+      return;
+    }
+    values.date = idCalendar.date;
     values.negativeCode = normalizeRollId(values.negativeCode || values.id);
     values.folderName = buildFolderName(values);
+    const milestone = statusMilestoneField(values.status);
+    const previous = app.editor.id ? app.state.rolls.find((roll) => roll.id === app.editor.id) : null;
+    if (milestone && !values[milestone]) {
+      values[milestone] = previous?.[milestone] || localCalendarDateToIso(new Date());
+    }
   }
 
+  rememberUndo();
   const collection = collectionFor(app.editor.type);
   if (app.editor.id) {
     const index = app.state[collection].findIndex((item) => item.id === app.editor.id);
@@ -3349,10 +4226,14 @@ function saveEditor(event) {
     ? "Rolo guardado e stock atualizado."
     : selectedStockWasEmpty
       ? "Rolo guardado. O stock selecionado já estava a zero."
-      : "Guardado.");
+      : "Guardado.", { undo: true });
   if (editorType === "roll") {
     const savedRoll = app.state.rolls.find((roll) => roll.id === values.id);
     if (savedRoll) void geocodeRollLocations(savedRoll);
+  }
+  if (saveAnother) {
+    openEditor("roll", null, { prefill: captureFields(values) });
+    showToast("Rolo guardado. O próximo registo está pronto.");
   }
 }
 
@@ -3361,12 +4242,13 @@ function deleteEditorItem() {
   const confirmed = confirm(uiText("Eliminar este registo?"));
   if (!confirmed) return;
 
+  rememberUndo();
   const collection = collectionFor(app.editor.type);
   app.state[collection] = app.state[collection].filter((item) => item.id !== app.editor.id);
   persistState();
   closeEditor();
   render();
-  showToast("Registo eliminado.");
+  showToast("Registo eliminado.", { undo: true });
 }
 
 function renderEditorFields(type, item) {
@@ -3396,23 +4278,23 @@ function editorFieldGroups(type) {
   if (type === "roll") {
     if (!app.editor?.id) {
       return [
-        { label: "Dados essenciais", fields: ["date", "camera", "lens", "filmBrand", "filmModel", "iso", "format", "type", "push", "shotLocation"], open: true },
+        { label: "Dados essenciais", fields: ["date", "camera", "lens", "filmBrand", "filmModel", "iso", "format", "type", "push", "shotLocation", "project"], open: true },
         { label: "Identificação automática", fields: ["id", "status", "negativeCode"], open: false },
-        { label: "Processamento", fields: ["developedAt", "scannedAt", "developerMethod"], open: false },
-        { label: "Arquivo e notas", fields: ["folderName", "photosUrl", "archiveLocation", "favorite", "notes"], open: false },
+        { label: "Processamento e custos", fields: ["developedAt", "scannedAt", "developerMethod", "filmCost", "developmentCost", "scanCost", "shotCompletedAt", "developmentCompletedAt", "scanCompletedAt", "archivedAt"], open: false },
+        { label: "Arquivo físico e notas", fields: ["folderName", "photosUrl", "archiveLocation", "negativePresent", "contactSheetPresent", "scanFilesPresent", "favorite", "notes"], open: false },
       ];
     }
     return [
       { label: "Identificação", fields: ["id", "status", "date", "negativeCode"], open: true },
-      { label: "Captura", fields: ["camera", "lens", "filmBrand", "filmModel", "iso", "format", "type", "push", "shotLocation"], open: true },
-      { label: "Processamento", fields: ["developedAt", "scannedAt", "developerMethod"], open: true },
-      { label: "Arquivo", fields: ["folderName", "photosUrl", "archiveLocation", "favorite", "notes"], open: true },
+      { label: "Captura", fields: ["camera", "lens", "filmBrand", "filmModel", "iso", "format", "type", "push", "shotLocation", "project"], open: true },
+      { label: "Processamento e custos", fields: ["developedAt", "scannedAt", "developerMethod", "filmCost", "developmentCost", "scanCost", "shotCompletedAt", "developmentCompletedAt", "scanCompletedAt", "archivedAt"], open: true },
+      { label: "Arquivo", fields: ["folderName", "photosUrl", "archiveLocation", "negativePresent", "contactSheetPresent", "scanFilesPresent", "favorite", "notes"], open: true },
     ];
   }
   if (type === "stock") {
     return [
       { label: "Filme", fields: ["brand", "model", "format", "iso", "type"], open: true },
-      { label: "Inventário", fields: ["quantity", "condition", "expiryDate", "note"], open: true },
+      { label: "Inventário", fields: ["quantity", "condition", "purchasedAt", "unitCost", "expiryDate", "note"], open: true },
     ];
   }
   return [
@@ -3423,6 +4305,7 @@ function editorFieldGroups(type) {
 
 function renderRollQuickStart() {
   const recentRolls = sortRolls(app.state.rolls);
+  const templates = app.state.workflow.templates.slice(0, 8);
   const cameras = recentUniqueValues(recentRolls, (roll) => roll.camera, 4);
   const locations = recentUniqueValues(recentRolls, (roll) => roll.shotLocation, 4);
   const stockItems = app.state.stock
@@ -3430,6 +4313,39 @@ function renderRollQuickStart() {
     .sort((a, b) => localeSort(a.brand, b.brand) || localeSort(a.model, b.model))
     .slice(0, 8);
   const selectedStockId = text(app.editor?.stockItemId);
+  const categories = [
+    templates.length ? {
+      id: "template",
+      label: "Modelos",
+      icon: "layout-template",
+      title: "Modelos pessoais",
+      buttons: templates.map((template) => `<button class="quick-preset" type="button" data-action="apply-roll-preset" data-preset="template" data-id="${escapeAttr(template.id)}">${uiIcon("layout-template")}<span>${escapeHtml(template.name)}</span></button>`).join(""),
+    } : null,
+    cameras.length ? {
+      id: "camera",
+      label: "Câmara",
+      icon: "camera",
+      title: "Câmara recente",
+      buttons: cameras.map((camera) => `<button class="quick-preset" type="button" data-action="apply-roll-preset" data-preset="camera" data-value="${escapeAttr(camera)}">${uiIcon("camera")}<span>${escapeHtml(camera)}</span></button>`).join(""),
+    } : null,
+    stockItems.length ? {
+      id: "stock",
+      label: "Filme",
+      icon: "package",
+      title: "Filme em stock",
+      buttons: stockItems.map((stockItem) => `<button class="quick-preset ${selectedStockId === stockItem.id ? "selected" : ""}" type="button" data-action="apply-roll-preset" data-preset="stock" data-id="${escapeAttr(stockItem.id)}">${uiIcon("package")}<span>${escapeHtml(stockItem.brand)} ${escapeHtml(stockItem.model)} · ISO ${escapeHtml(stockItem.iso)}</span><small>${formatNumber(stockItem.quantity)}</small></button>`).join(""),
+    } : null,
+    locations.length ? {
+      id: "location",
+      label: "Local",
+      icon: "map-pin",
+      title: "Local recente",
+      buttons: locations.map((location) => `<button class="quick-preset" type="button" data-action="apply-roll-preset" data-preset="location" data-value="${escapeAttr(location)}">${uiIcon("map-pin")}<span>${escapeHtml(location)}</span></button>`).join(""),
+    } : null,
+  ].filter(Boolean);
+  const activeCategory = selectedStockId && categories.some((category) => category.id === "stock")
+    ? "stock"
+    : categories[0]?.id;
 
   return `
     <section class="roll-quick-start">
@@ -3440,15 +4356,29 @@ function renderRollQuickStart() {
         </div>
         ${uiIcon("zap")}
       </div>
-      ${cameras.length ? `<div class="quick-preset-row"><span>Câmara recente</span><div>${cameras.map((camera) => `<button class="quick-preset" type="button" data-action="apply-roll-preset" data-preset="camera" data-value="${escapeAttr(camera)}">${uiIcon("camera")}<span>${escapeHtml(camera)}</span></button>`).join("")}</div></div>` : ""}
-      ${stockItems.length ? `<div class="quick-preset-row"><span>Filme em stock</span><div>${stockItems.map((stockItem) => `<button class="quick-preset ${selectedStockId === stockItem.id ? "selected" : ""}" type="button" data-action="apply-roll-preset" data-preset="stock" data-id="${escapeAttr(stockItem.id)}">${uiIcon("package")}<span>${escapeHtml(stockItem.brand)} ${escapeHtml(stockItem.model)} · ISO ${escapeHtml(stockItem.iso)}</span><small>${formatNumber(stockItem.quantity)}</small></button>`).join("")}</div></div>` : ""}
-      ${locations.length ? `<div class="quick-preset-row"><span>Local recente</span><div>${locations.map((location) => `<button class="quick-preset" type="button" data-action="apply-roll-preset" data-preset="location" data-value="${escapeAttr(location)}">${uiIcon("map-pin")}<span>${escapeHtml(location)}</span></button>`).join("")}</div></div>` : ""}
+      <div class="quick-preset-tabs" role="tablist" aria-label="Escolhas rápidas">
+        ${categories.map((category) => `<button class="${category.id === activeCategory ? "active" : ""}" type="button" role="tab" aria-selected="${category.id === activeCategory}" data-action="select-quick-preset-tab" data-preset="${category.id}">${uiIcon(category.icon)}<span>${category.label}</span></button>`).join("")}
+      </div>
+      ${categories.map((category) => `<div class="quick-preset-row" data-quick-preset-pane="${category.id}" ${category.id === activeCategory ? "" : "hidden"}><span>${category.title}</span><div>${category.buttons}</div></div>`).join("")}
       <label class="quick-stock-choice" data-stock-consumption ${selectedStockId ? "" : "hidden"}>
         <input type="checkbox" name="consumeStock" ${selectedStockId ? "checked" : ""}>
         <span>Retirar uma unidade deste stock ao guardar</span>
       </label>
     </section>
   `;
+}
+
+function selectQuickPresetTab(preset) {
+  const selected = text(preset);
+  if (!selected || !editorFields) return;
+  editorFields.querySelectorAll("[data-quick-preset-pane]").forEach((pane) => {
+    pane.hidden = pane.dataset.quickPresetPane !== selected;
+  });
+  editorFields.querySelectorAll('[data-action="select-quick-preset-tab"]').forEach((button) => {
+    const active = button.dataset.preset === selected;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
 }
 
 function recentUniqueValues(items, picker, limit) {
@@ -3465,6 +4395,43 @@ function recentUniqueValues(items, picker, limit) {
   return values;
 }
 
+function handleLaunchShortcut() {
+  const params = new URLSearchParams(window.location?.search || "");
+  if (params.get("action") !== "new-roll") return;
+  window.setTimeout(() => openEditor("roll"), 50);
+  try {
+    const cleanUrl = `${window.location?.pathname || "/"}${window.location?.hash || ""}`;
+    window.history?.replaceState?.({}, "", cleanUrl);
+  } catch {
+    // O atalho continua funcional mesmo se o navegador bloquear a limpeza do URL.
+  }
+}
+
+function startFieldDictation(fieldName) {
+  const input = editorForm.elements[text(fieldName)];
+  if (!input) return;
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    showToast("O ditado direto não está disponível neste navegador. Usa o microfone do teclado do telefone.");
+    input.focus();
+    return;
+  }
+  const recognition = new SpeechRecognition();
+  recognition.lang = app.language === "en" ? "en-GB" : "pt-PT";
+  recognition.interimResults = false;
+  recognition.maxAlternatives = 1;
+  recognition.onresult = (event) => {
+    const transcript = text(event.results?.[0]?.[0]?.transcript);
+    if (!transcript) return;
+    input.value = `${input.value ? `${input.value.trim()} ` : ""}${transcript}`;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    showToast("Ditado acrescentado às notas.");
+  };
+  recognition.onerror = () => showToast("O ditado não foi concluído. As notas existentes foram preservadas.");
+  recognition.start();
+  showToast("A ouvir…");
+}
+
 function renderField(field, item) {
   const value = item[field.name] ?? "";
   const label = `<label for="field-${field.name}">${escapeHtml(field.label)}</label>`;
@@ -3472,7 +4439,7 @@ function renderField(field, item) {
   if (field.type === "textarea") {
     return `
       <div class="field full">
-        ${label}
+        <span class="field-label-row">${label}${field.dictation ? `<button class="text-button dictation-button" type="button" data-action="dictate-field" data-field="${escapeAttr(field.name)}">${uiIcon("mic")}<span>Ditar</span></button>` : ""}</span>
         <textarea id="field-${field.name}" name="${escapeAttr(field.name)}">${escapeHtml(value)}</textarea>
       </div>
     `;
@@ -3557,14 +4524,25 @@ function fieldsFor(type) {
       { name: "type", label: "Tipo", type: "select", options: ["B&W", "Cor"] },
       { name: "push", label: "Push", type: "number" },
       { name: "shotLocation", label: "Local disparado", type: "text", wide: true },
+      { name: "project", label: "Projeto/viagem", type: "text", wide: true },
       { name: "developedAt", label: "Local revelado", type: "combo", options: labOptions },
       { name: "scannedAt", label: "Local digitalizado", type: "combo", options: labOptions },
       { name: "developerMethod", label: "Revelador/método", type: "text", wide: true },
+      { name: "filmCost", label: "Custo do filme", type: "number", step: "0.01" },
+      { name: "developmentCost", label: "Custo da revelação", type: "number", step: "0.01" },
+      { name: "scanCost", label: "Custo da digitalização", type: "number", step: "0.01" },
+      { name: "shotCompletedAt", label: "Disparo concluído", type: "date" },
+      { name: "developmentCompletedAt", label: "Revelação concluída", type: "date" },
+      { name: "scanCompletedAt", label: "Digitalização concluída", type: "date" },
+      { name: "archivedAt", label: "Arquivado em", type: "date" },
       { name: "folderName", label: "Nome da pasta", type: "computed", wide: true },
       { name: "photosUrl", label: "Link Google Photos", type: "url", wide: true },
       { name: "archiveLocation", label: "Local de arquivo", type: "text", wide: true },
+      { name: "negativePresent", label: "Negativo confirmado", type: "checkbox" },
+      { name: "contactSheetPresent", label: "Folha de contacto confirmada", type: "checkbox" },
+      { name: "scanFilesPresent", label: "Digitalizações confirmadas", type: "checkbox" },
       { name: "favorite", label: "Favorito", type: "checkbox" },
-      { name: "notes", label: "Notas", type: "textarea" },
+      { name: "notes", label: "Notas", type: "textarea", dictation: true },
     ];
   }
 
@@ -3577,6 +4555,8 @@ function fieldsFor(type) {
       { name: "type", label: "Tipo", type: "select", options: ["B&W", "Cor"] },
       { name: "quantity", label: "Quantidade", type: "number" },
       { name: "condition", label: "Estado", type: "select", options: ["Novo", "Expirado"] },
+      { name: "purchasedAt", label: "Data de compra", type: "date" },
+      { name: "unitCost", label: "Custo por rolo", type: "number", step: "0.01" },
       { name: "expiryDate", label: "Validade", type: "date" },
       { name: "note", label: "Nota", type: "textarea" },
     ];
@@ -3597,7 +4577,7 @@ function fieldsFor(type) {
 
 function defaultItem(type) {
   if (type === "roll") {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = `${localCalendarDateToIso(new Date()).slice(0, 7)}-01`;
     return {
       id: nextRollId(today),
       status: "Em Uso",
@@ -3620,6 +4600,18 @@ function defaultItem(type) {
       folderName: "",
       archiveLocation: "",
       favorite: false,
+      project: "",
+      filmCost: 0,
+      developmentCost: 0,
+      scanCost: 0,
+      negativePresent: false,
+      contactSheetPresent: false,
+      scanFilesPresent: false,
+      shotCompletedAt: "",
+      developmentCompletedAt: "",
+      scanCompletedAt: "",
+      archivedAt: "",
+      archiveUpdatedAt: "",
     };
   }
 
@@ -3633,6 +4625,8 @@ function defaultItem(type) {
       type: "B&W",
       quantity: 1,
       condition: "Novo",
+      purchasedAt: "",
+      unitCost: 0,
       expiryDate: "",
       note: "",
     };
@@ -3700,6 +4694,7 @@ function getFilteredRolls() {
       roll.developedAt,
       roll.scannedAt,
       roll.developerMethod,
+      roll.project,
       roll.photosUrl,
       roll.notes,
       roll.folderName,
@@ -3711,7 +4706,8 @@ function getFilteredRolls() {
       && (!app.filters.rollsStatus || (app.filters.rollsStatus === "__open" ? roll.status !== "Arquivado" : roll.status === app.filters.rollsStatus))
       && (!app.filters.rollsCamera || roll.camera === app.filters.rollsCamera)
       && (!app.filters.rollsFormat || roll.format === app.filters.rollsFormat)
-      && (!app.filters.rollsType || roll.type === app.filters.rollsType);
+      && (!app.filters.rollsType || roll.type === app.filters.rollsType)
+      && (app.filters.rollsFavorite !== "only" || roll.favorite);
   }));
 }
 
@@ -3745,6 +4741,7 @@ function applyRollFilterShortcut(filter) {
   app.filters.rollsCamera = "";
   app.filters.rollsFormat = "";
   app.filters.rollsType = "";
+  app.filters.rollsFavorite = "";
 
   if (!filter || filter === "all") {
     app.activeView = "rolls";
@@ -4025,6 +5022,15 @@ function detailField(label, value, size = "", raw = false) {
   `;
 }
 
+function physicalArchiveSummary(roll) {
+  const parts = [
+    roll.negativePresent ? "Negativo ✓" : "Negativo em falta",
+    roll.contactSheetPresent ? "Folha de contacto ✓" : "Sem folha de contacto",
+    roll.scanFilesPresent ? "Digitalizações ✓" : "Digitalizações em falta",
+  ];
+  return parts.join(" · ");
+}
+
 function statusTimeline(currentStatus) {
   const currentIndex = defaultSupport.statuses.indexOf(currentStatus);
   return `
@@ -4071,9 +5077,13 @@ function advanceRollStatus(id) {
     return;
   }
 
+  rememberUndo();
+  const milestone = statusMilestoneField(next);
+  const milestoneDate = localCalendarDateToIso(new Date());
   app.state.rolls[index] = {
     ...current,
     status: next,
+    ...(milestone && !current[milestone] ? { [milestone]: milestoneDate } : {}),
   };
   app.state = normalizeState(app.state);
   persistState();
@@ -4084,7 +5094,16 @@ function advanceRollStatus(id) {
     renderDetails(updated);
   }
 
-  showToast(`Estado alterado para ${next}.`);
+  showToast(`Estado alterado para ${next}.`, { undo: true });
+}
+
+function statusMilestoneField(status) {
+  return ({
+    Disparado: "shotCompletedAt",
+    Revelado: "developmentCompletedAt",
+    Digitalizado: "scanCompletedAt",
+    Arquivado: "archivedAt",
+  })[status] || "";
 }
 
 function refreshComputedFields() {
@@ -4157,6 +5176,7 @@ async function exportExcelWorkbook() {
       Estado: roll.status,
       Data: roll.date,
       "Local Disparado": roll.shotLocation,
+      "Projeto/Viagem": roll.project,
       Camera: roll.camera,
       Lente: roll.lens,
       MarcaRolo: roll.filmBrand,
@@ -4168,9 +5188,19 @@ async function exportExcelWorkbook() {
       "Local Revelado": roll.developedAt,
       "Local Digitalizado": roll.scannedAt,
       "Revelador/Metodo": roll.developerMethod,
+      "Custo Filme": roll.filmCost,
+      "Custo Revelação": roll.developmentCost,
+      "Custo Digitalização": roll.scanCost,
+      "Disparo Concluído": roll.shotCompletedAt,
+      "Revelação Concluída": roll.developmentCompletedAt,
+      "Digitalização Concluída": roll.scanCompletedAt,
+      "Arquivado Em": roll.archivedAt,
       "Google Photos": roll.photosUrl,
       Notas: roll.notes,
       "Local Arquivo": roll.archiveLocation,
+      "Negativo Confirmado": roll.negativePresent,
+      "Folha Contacto Confirmada": roll.contactSheetPresent,
+      "Digitalizações Confirmadas": roll.scanFilesPresent,
     }));
     const stockRows = (format) => app.state.stock
       .filter((item) => item.format === format)
@@ -4181,6 +5211,8 @@ async function exportExcelWorkbook() {
         Tipo: item.type,
         Quantidade: item.quantity,
         Estado: item.condition,
+        "Data Compra": item.purchasedAt,
+        "Custo Unitário": item.unitCost,
         Validade: item.expiryDate,
         Nota: item.note,
       }));
@@ -4217,20 +5249,96 @@ function appendWorkbookSheet(workbook, name, rows) {
   window.XLSX.utils.book_append_sheet(workbook, sheet, name);
 }
 
+function installImportedArchive(imported) {
+  const previousSync = normalizeCloudBackupMeta(app.state?.meta || {});
+  const needsOnlineReplacement = isPrivateAccessRequired();
+  const next = normalizeState(imported);
+  next.meta = {
+    ...next.meta,
+    ...previousSync,
+    autoCloudBackup: needsOnlineReplacement ? false : previousSync.autoCloudBackup,
+    cloudBackupPending: needsOnlineReplacement,
+    localRevision: numberOrZero(previousSync.localRevision) + 1,
+    releaseVersion: RELEASE_VERSION,
+    updatedAt: new Date().toISOString(),
+  };
+  app.state = next;
+  persistState({ skipAutomaticBackup: true, preserveUpdatedAt: true });
+  setImportedReplacementPending(needsOnlineReplacement);
+  window.clearTimeout(app.cloud.backupTimer);
+  window.clearTimeout(app.cloud.syncTimer);
+  app.cloud.currentUnsubscribe?.();
+  app.cloud.currentUnsubscribe = null;
+  if (needsOnlineReplacement) {
+    app.cloud.status = "Base importada e protegida neste dispositivo. Falta começar o novo arquivo online.";
+  }
+}
+
+function isImportedReplacementPending() {
+  try {
+    return localStorage.getItem(IMPORT_REPLACEMENT_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function setImportedReplacementPending(pending) {
+  try {
+    if (pending) localStorage.setItem(IMPORT_REPLACEMENT_STORAGE_KEY, "true");
+    else localStorage.removeItem(IMPORT_REPLACEMENT_STORAGE_KEY);
+  } catch (error) {
+    console.warn("Não foi possível guardar o estado da nova importação.", error);
+  }
+}
+
 async function importJson(file) {
   try {
     const textValue = await file.text();
-    const imported = normalizeState(JSON.parse(textValue));
+    const raw = JSON.parse(textValue);
+    raw.rolls = reconcileImportedRollDates(raw.rolls, "backup JSON");
+    const imported = normalizeState(raw);
+    const diff = backupRestoreDiff(app.state, imported);
+    if (!confirm(uiText(`Pré-visualização do restauro:\n${restoreDiffSummary(diff)}\n\nContinuar e substituir os dados atuais?`))) return;
     const bundledSeed = await loadSeed();
     imported.meta.seedRevision = bundledSeed.meta?.seedRevision || imported.meta.seedRevision || app.state.meta.seedRevision || SEED_REVISION;
     imported.meta.releaseVersion = RELEASE_VERSION;
-    app.state = imported;
-    persistState();
+    installImportedArchive(imported);
     render();
-    showToast("Backup importado.");
+    showToast(isImportedReplacementPending()
+      ? "Backup importado localmente. Confirma agora o novo início no Firebase."
+      : "Backup importado.");
   } catch (error) {
-    showToast("O ficheiro não parece ser um backup válido.");
+    console.error(error);
+    showToast(error?.code === "rolos/import-validation"
+      ? error.message
+      : "O ficheiro não parece ser um backup válido.");
   }
+}
+
+async function verifyJsonBackup(file) {
+  try {
+    const raw = JSON.parse(await file.text());
+    raw.rolls = reconcileImportedRollDates(raw.rolls, "backup JSON");
+    const candidate = normalizeState(raw);
+    const diff = backupRestoreDiff(app.state, candidate);
+    const report = diff.candidateIntegrity;
+    showToast(report.ok
+      ? `Backup válido: ${report.rolls} rolos, ${report.stockQuantity} unidades de stock e zero incompatibilidades.`
+      : `Backup legível, mas com ${report.duplicateIds.length + report.invalidIds.length + report.dateMismatches.length} problemas de integridade.`);
+  } catch (error) {
+    console.error(error);
+    showToast(error?.message || "Este ficheiro não pode ser restaurado com segurança.");
+  }
+}
+
+function restoreDiffSummary(diff) {
+  const integrity = diff.candidateIntegrity;
+  return [
+    `Rolos: ${diff.currentRolls} → ${diff.candidateRolls}`,
+    `Novos: ${diff.added.length} · removidos: ${diff.removed.length} · alterados: ${diff.changed.length}`,
+    `Stock: ${diff.stockDelta >= 0 ? "+" : ""}${diff.stockDelta} · equipamento: ${diff.equipmentDelta >= 0 ? "+" : ""}${diff.equipmentDelta}`,
+    `Integridade: ${integrity.ok ? "sem erros" : `${integrity.duplicateIds.length + integrity.invalidIds.length + integrity.dateMismatches.length} problemas`}`,
+  ].join("\n");
 }
 
 async function importExcel(file) {
@@ -4245,13 +5353,16 @@ async function importExcel(file) {
     const bundledSeed = await loadSeed();
     imported.meta.seedRevision = bundledSeed.meta?.seedRevision || imported.meta.seedRevision || app.state.meta.seedRevision || SEED_REVISION;
     imported.meta.releaseVersion = RELEASE_VERSION;
-    app.state = normalizeState(mergeSeedUpgrade(app.state, imported));
-    persistState();
+    installImportedArchive(normalizeState(mergeSeedUpgrade(app.state, imported)));
     render();
-    showToast("Excel importado.");
+    showToast(isImportedReplacementPending()
+      ? "Excel importado localmente. Confirma agora o novo início no Firebase."
+      : "Excel importado.");
   } catch (error) {
     console.error(error);
-    showToast("Não consegui importar este Excel. Confirma se tem as folhas esperadas.");
+    showToast(error?.code === "rolos/import-validation"
+      ? error.message
+      : "Não consegui importar este Excel. Confirma se tem as folhas esperadas.");
   }
 }
 
@@ -4274,13 +5385,14 @@ function buildStateFromExcelWorkbook(workbook, sourceFile) {
   const stock120Rows = readExcelTable(workbook, "Stock 120mm", ["Marca", "Modelo", "Quantidade"], false);
   const equipmentRows = readExcelTable(workbook, "Equipamento", ["Tipo", "Marca", "Modelo"], false);
 
-  const rolls = rollsRows.map((row) => {
+  const rolls = reconcileImportedRollDates(rollsRows.map((row) => {
     const id = normalizeRollId(row["ID Rolo"]);
     const roll = {
       id,
       status: cleanExcelValue(row.Estado),
       date: excelDateToIso(row.Data),
       shotLocation: cleanExcelValue(row["Local Disparado"]),
+      project: cleanExcelValue(row["Projeto/Viagem"]),
       camera: cleanExcelValue(row.Camera),
       lens: cleanExcelValue(row.Lente),
       filmBrand: cleanExcelValue(row.MarcaRolo),
@@ -4292,10 +5404,20 @@ function buildStateFromExcelWorkbook(workbook, sourceFile) {
       developedAt: cleanExcelValue(row["Local Revelado"]),
       scannedAt: cleanExcelValue(row["Local Digitalizado"]),
       developerMethod: cleanExcelValue(row["Revelador/Metodo"] || row["Revelador/Método"]),
+      filmCost: numberOrZero(row["Custo Filme"]),
+      developmentCost: numberOrZero(row["Custo Revelação"]),
+      scanCost: numberOrZero(row["Custo Digitalização"]),
+      shotCompletedAt: excelDateToIso(row["Disparo Concluído"]),
+      developmentCompletedAt: excelDateToIso(row["Revelação Concluída"]),
+      scanCompletedAt: excelDateToIso(row["Digitalização Concluída"]),
+      archivedAt: excelDateToIso(row["Arquivado Em"]),
       photosUrl: cleanExcelValue(row["Google Photos"] || row.photosUrl),
       notes: cleanExcelValue(row.Notas),
       negativeCode: id,
       archiveLocation: cleanExcelValue(row["Local Arquivo"]),
+      negativePresent: excelBoolean(row["Negativo Confirmado"]),
+      contactSheetPresent: excelBoolean(row["Folha Contacto Confirmada"]),
+      scanFilesPresent: excelBoolean(row["Digitalizações Confirmadas"]),
       favorite: false,
       createdFrom: "excel",
     };
@@ -4303,7 +5425,7 @@ function buildStateFromExcelWorkbook(workbook, sourceFile) {
       ...roll,
       folderName: buildFolderName(roll),
     };
-  });
+  }), "Excel");
 
   const stock = [
     ...stock35Rows.map((row, index) => excelStockRow(row, "135", index)),
@@ -4352,6 +5474,8 @@ function excelStockRow(row, format, index) {
     type: cleanExcelValue(row.Tipo),
     quantity: numberOrZero(row.Quantidade),
     condition: cleanExcelValue(row.Estado),
+    purchasedAt: excelDateToIso(row["Data Compra"]),
+    unitCost: numberOrZero(row["Custo Unitário"]),
     expiryDate,
     note: isIsoDate(note) ? "" : note,
     createdFrom: "excel",
@@ -4380,24 +5504,19 @@ function readExcelTable(workbook, sheetName, requiredHeaders, required = true) {
 
 function cleanExcelValue(value) {
   if (value === null || value === undefined) return "";
-  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (value instanceof Date) return calendarValueToIso(value);
   if (typeof value === "string") return value.trim();
   if (typeof value === "number" && Number.isInteger(value)) return String(value);
   return String(value).trim();
 }
 
+function excelBoolean(value) {
+  if (value === true || value === 1) return true;
+  return ["sim", "yes", "true", "1", "x"].includes(normalizeSearchValue(value));
+}
+
 function excelDateToIso(value) {
-  if (!value) return "";
-  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().slice(0, 10);
-  if (typeof value === "number" && value > 20000) {
-    const date = new Date(Math.round((value - 25569) * 86400 * 1000));
-    return date.toISOString().slice(0, 10);
-  }
-  const textValue = cleanExcelValue(value);
-  if (!textValue || textValue === "-") return "";
-  if (isIsoDate(textValue)) return textValue;
-  const parsed = new Date(textValue);
-  return Number.isNaN(parsed.getTime()) ? "" : parsed.toISOString().slice(0, 10);
+  return calendarValueToIso(value);
 }
 
 async function resetSeed() {
@@ -4416,6 +5535,7 @@ function rollCsvColumns() {
     ["status", "Estado"],
     ["date", "Data"],
     ["shotLocation", "Local Disparado"],
+    ["project", "Projeto/Viagem"],
     ["camera", "Câmara"],
     ["lens", "Lente"],
     ["filmBrand", "MarcaRolo"],
@@ -4427,11 +5547,21 @@ function rollCsvColumns() {
     ["developedAt", "Local Revelado"],
     ["scannedAt", "Local Digitalizado"],
     ["developerMethod", "Revelador/Método"],
+    ["filmCost", "Custo Filme"],
+    ["developmentCost", "Custo Revelação"],
+    ["scanCost", "Custo Digitalização"],
+    ["shotCompletedAt", "Disparo Concluído"],
+    ["developmentCompletedAt", "Revelação Concluída"],
+    ["scanCompletedAt", "Digitalização Concluída"],
+    ["archivedAt", "Arquivado Em"],
     ["photosUrl", "Google Photos"],
     ["notes", "Notas"],
     ["folderName", "Nome Pasta"],
     ["negativeCode", "Código Negativo"],
     ["archiveLocation", "Local Arquivo"],
+    ["negativePresent", "Negativo Confirmado"],
+    ["contactSheetPresent", "Folha Contacto Confirmada"],
+    ["scanFilesPresent", "Digitalizações Confirmadas"],
   ].map(([key, label]) => ({ key, label }));
 }
 
@@ -4444,6 +5574,8 @@ function stockCsvColumns() {
     ["type", "Tipo"],
     ["quantity", "Quantidade"],
     ["condition", "Estado"],
+    ["purchasedAt", "Data Compra"],
+    ["unitCost", "Custo Unitário"],
     ["expiryDate", "Validade"],
     ["note", "Nota"],
   ].map(([key, label]) => ({ key, label }));
@@ -4578,6 +5710,7 @@ async function createDriveBackup() {
     const driveClient = createDriveBackupClient(accessToken);
     const timestamp = new Date().toISOString();
     const weekKey = isoWeekKey(timestamp);
+    const backupKey = driveBackupKey(timestamp, weekKey);
     const folder = await driveClient.ensureBackupFolder();
     const stateSnapshot = structuredClone(app.state);
     stateSnapshot.meta = {
@@ -4585,21 +5718,16 @@ async function createDriveBackup() {
       releaseVersion: RELEASE_VERSION,
       driveBackupCreatedAt: timestamp,
       driveBackupWeekKey: weekKey,
+      driveBackupId: backupKey,
     };
     const content = JSON.stringify(stateSnapshot, null, 2);
-    const file = await driveClient.uploadWeeklyBackup(folder.id, weekKey, content);
-
-    try {
-      await driveClient.pruneBackupHistory();
-    } catch (retentionError) {
-      console.warn("A cópia foi criada, mas a retenção do Drive não foi revista.", retentionError);
-    }
+    const file = await driveClient.uploadManualBackup(folder.id, backupKey, weekKey, content);
 
     const status = saveLocalDriveBackupStatus({
       lastBackupAt: timestamp,
       weekKey,
       fileId: file.id,
-      fileName: file.name || `rolos-backup-${weekKey}.json`,
+      fileName: file.name || `rolos-backup-${backupKey}.json`,
       fileUrl: file.webViewLink || `https://drive.google.com/file/d/${file.id}/view`,
       folderId: folder.id,
       folderUrl: `https://drive.google.com/drive/folders/${folder.id}`,
@@ -4620,7 +5748,7 @@ async function createDriveBackup() {
       console.warn("A cópia foi criada, mas o aviso não ficou sincronizado entre dispositivos.", statusError);
     }
 
-    showToast("Backup semanal guardado no Google Drive.");
+    showToast("Nova cópia independente guardada no Google Drive.");
   } catch (error) {
     console.error("A cópia para o Google Drive falhou.", error);
     app.cloud.driveBackupError = driveBackupErrorMessage(error);
@@ -4662,7 +5790,106 @@ function driveBackupErrorMessage(error) {
   return "Não foi possível criar o backup no Google Drive. A cópia Firebase continua segura.";
 }
 
+async function resetCloudFromCurrentArchive() {
+  if (!isImportedReplacementPending()) {
+    showToast("Importa primeiro o backup que queres usar como novo início.");
+    return false;
+  }
+
+  const confirmed = confirm(uiText("Começar de novo elimina a versão atual, o historial semanal e as cópias de recuperação anteriores do Firebase. O backup importado neste dispositivo será guardado como versão 1. Fechaste a app nos outros dispositivos?"));
+  if (!confirmed) return false;
+  const typed = prompt(uiText("Para confirmar, escreve RECOMEÇAR."), "");
+  if (text(typed).toUpperCase() !== "RECOMEÇAR") {
+    showToast("Operação cancelada. A base importada continua segura neste dispositivo.");
+    return false;
+  }
+
+  await connectCloud();
+  if (!app.cloud.user || !isAuthorizedCloudUser(app.cloud.user)) {
+    app.cloud.status = "Entra com a conta autorizada antes de começar o novo arquivo online.";
+    render();
+    return false;
+  }
+
+  app.cloud.backupInProgress = true;
+  app.cloud.currentUnsubscribe?.();
+  app.cloud.currentUnsubscribe = null;
+  render();
+
+  try {
+    const timestamp = new Date().toISOString();
+    const stateSnapshot = structuredClone(app.state);
+    const contentHash = stateFingerprint(stateSnapshot);
+    stateSnapshot.meta = {
+      ...stateSnapshot.meta,
+      autoCloudBackup: true,
+      cloudBackupInitialized: true,
+      cloudBackupPending: false,
+      cloudRevision: 1,
+      lastSyncedContentHash: contentHash,
+      lastCloudBackupAt: timestamp,
+      lastSyncCheckAt: timestamp,
+      lastWeeklyBackupKey: "",
+      lastWeeklyBackupRevision: 0,
+      lastRetentionCheckKey: "",
+      weeklyBackupPending: false,
+      releaseVersion: RELEASE_VERSION,
+      updatedAt: timestamp,
+    };
+
+    const prepared = prepareCloudPayload(stateSnapshot, timestamp, contentHash);
+    const replacementImageIds = prepared.imageRecords.map((record) => record.docId);
+    await persistCloudImages(prepared.imageRecords);
+
+    const snapshot = await app.cloud.modules.getDocs(cloudBackupsCollectionRef());
+    const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+    const resetPlan = cloudArchiveResetPlan(records, replacementImageIds);
+
+    await app.cloud.modules.runTransaction(app.cloud.db, async (transaction) => {
+      resetPlan.removeIds.forEach((id) => transaction.delete(cloudDocumentRef(id)));
+      transaction.set(cloudBackupRef(), {
+        kind: "current",
+        schemaVersion: SYNC_SCHEMA_VERSION,
+        revision: 1,
+        contentHash,
+        sourceDeviceId: getDeviceId(),
+        payload: prepared.payload,
+        updatedAt: app.cloud.modules.serverTimestamp(),
+        updatedAtLocal: timestamp,
+      });
+    });
+
+    app.state = normalizeState(stateSnapshot);
+    persistState({ skipAutomaticBackup: true, preserveUpdatedAt: true });
+    setImportedReplacementPending(false);
+    app.cloud.history = [];
+    app.cloud.historyUsage = null;
+    app.cloud.historyLoadedAt = 0;
+    app.cloud.status = `Novo início concluído. Versão 1 com ${formatRollCount(app.state.rolls.length)} guardada no Firebase.`;
+    startCloudSyncListener();
+    render();
+    showToast("A base importada é agora a versão 1. O historial Firebase anterior foi eliminado.");
+    return true;
+  } catch (error) {
+    console.error("Não foi possível começar o novo arquivo online.", error);
+    app.state.meta.autoCloudBackup = false;
+    app.state.meta.cloudBackupPending = true;
+    persistState({ skipAutomaticBackup: true, preserveUpdatedAt: true });
+    app.cloud.status = "O novo início não ficou concluído. A base importada continua segura apenas neste dispositivo.";
+    render();
+    showToast("Não foi possível substituir o arquivo online. Nenhum dado local foi perdido.");
+    return false;
+  } finally {
+    app.cloud.backupInProgress = false;
+    render();
+  }
+}
+
 async function pushCloudBackup(options = {}) {
+  if (isImportedReplacementPending() && !options.allowImportedReplacement) {
+    showToast("Usa “Começar do zero online” para tornar a base importada na nova versão 1.");
+    return false;
+  }
   if (app.cloud.backupInProgress) return false;
   if (!options.skipConnect) await connectCloud();
   if (!app.cloud.user || !isAuthorizedCloudUser(app.cloud.user)) {
@@ -4740,6 +5967,7 @@ async function pushCloudBackup(options = {}) {
       timestamp,
       force: true,
     });
+    await updateDeviceCloudPresence(nextRevision, timestamp);
     app.cloud.status = options.silent
       ? `Sincronizado. Versão ${nextRevision} guardada.`
       : `Sincronização concluída. Versão ${nextRevision} guardada no Firebase.`;
@@ -4769,6 +5997,10 @@ async function pushCloudBackup(options = {}) {
 }
 
 async function pullCloudBackup() {
+  if (isImportedReplacementPending()) {
+    showToast("A base importada ainda não foi enviada. Usa “Começar do zero online” para evitar recuperar a versão antiga.");
+    return;
+  }
   await connectCloud();
   if (!app.cloud.user || !isAuthorizedCloudUser(app.cloud.user)) {
     app.cloud.status = "Entra com a conta autorizada para verificar a versão online.";
@@ -4839,6 +6071,13 @@ async function synchronizeWithCloud(options = {}) {
 
       const localHash = stateFingerprint(app.state);
       const cloudHash = cloudRecord.contentHash || stateFingerprint(cloudRecord.payload);
+      if (requiresSyncSchemaUpgrade(cloudRecord)) {
+        if (app.state.meta.cloudBackupPending && localHash !== cloudHash) {
+          await saveRecoveryCloudBackup(app.state, "antes da migração segura para a v2.5");
+        }
+        await applyCloudRecord(cloudRecord);
+        return pushCloudBackup({ silent: options.silent, skipConnect: true });
+      }
       let action = chooseSyncAction(app.state, { ...cloudRecord, contentHash: cloudHash });
       if (options.forcePull && localHash !== cloudHash) action = "recover-pull";
 
@@ -4882,6 +6121,7 @@ async function synchronizeWithCloud(options = {}) {
         timestamp: new Date().toISOString(),
       });
       app.cloud.status = `Sincronizado. Versão ${numberOrZero(cloudRecord.revision) || 1} disponível em todos os dispositivos.`;
+      await updateDeviceCloudPresence(numberOrZero(cloudRecord.revision), new Date().toISOString());
       if (app.ready) render();
       return true;
     } catch (error) {
@@ -5000,10 +6240,13 @@ async function ensureWeeklyCloudBackup(stateSnapshot, options = {}) {
       const ref = cloudDocumentRef(`weekly-${weekKey}`);
       const existing = await transaction.get(ref);
       if (existing.exists() && !shouldReplaceWeeklyBackup(existing.data()?.revision, revision)) return;
+      const existingMetadata = existing.exists() ? existing.data() : {};
       transaction.set(ref, {
         kind: "weekly",
         schemaVersion: SYNC_SCHEMA_VERSION,
         weekKey,
+        label: text(existingMetadata.label),
+        pinned: Boolean(existingMetadata.pinned),
         revision,
         contentHash,
         sourceDeviceId: getDeviceId(),
@@ -5086,6 +6329,36 @@ async function pruneCloudHistory() {
   app.cloud.historyLoadedAt = 0;
 }
 
+async function updateDeviceCloudPresence(revision, timestamp = new Date().toISOString()) {
+  if (!app.cloud.user || !app.cloud.modules) return false;
+  const deviceId = getDeviceId();
+  try {
+    await app.cloud.modules.setDoc(cloudDocumentRef(`device-${deviceId}`), {
+      kind: "device-status",
+      schemaVersion: SYNC_SCHEMA_VERSION,
+      label: currentDeviceLabel(),
+      releaseVersion: RELEASE_VERSION,
+      revision: numberOrZero(revision),
+      lastSeenAt: timestamp,
+      updatedAt: app.cloud.modules.serverTimestamp(),
+    }, { merge: true });
+    app.cloud.historyLoadedAt = 0;
+    return true;
+  } catch (error) {
+    console.warn("Não foi possível atualizar o diagnóstico deste dispositivo.", error);
+    return false;
+  }
+}
+
+function currentDeviceLabel() {
+  const agent = navigator.userAgent || "";
+  if (/Android/i.test(agent)) return "Telefone Android";
+  if (/iPhone|iPad/i.test(agent)) return "iPhone/iPad";
+  if (/Windows/i.test(agent)) return "PC Windows";
+  if (/Macintosh|Mac OS/i.test(agent)) return "Mac";
+  return "Navegador";
+}
+
 async function loadCloudHistory(options = {}) {
   if (!app.cloud.user || !app.cloud.modules || app.cloud.historyLoading) return;
   if (!options.force && Date.now() - app.cloud.historyLoadedAt < 60000) return;
@@ -5094,33 +6367,143 @@ async function loadCloudHistory(options = {}) {
   if (app.ready && app.activeView === "archive") render();
   try {
     const snapshot = await app.cloud.modules.getDocs(cloudBackupsCollectionRef());
-    app.cloud.history = snapshot.docs
-      .map((item) => ({ id: item.id, ...item.data() }))
+    const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+    app.cloud.historyUsage = cloudStorageSummary(records);
+    app.cloud.devices = records
+      .filter((item) => item.kind === "device-status")
+      .map((item) => ({
+        id: item.id.replace(/^device-/, ""),
+        label: text(item.label),
+        lastSeenAt: text(item.lastSeenAt),
+        releaseVersion: text(item.releaseVersion),
+        revision: numberOrZero(item.revision),
+      }))
+      .sort((a, b) => Date.parse(b.lastSeenAt || 0) - Date.parse(a.lastSeenAt || 0));
+    app.cloud.history = records
       .filter((item) => ["weekly", "recovery"].includes(item.kind))
       .map((item) => ({
         id: item.id,
         kind: item.kind,
         weekKey: text(item.weekKey),
         reason: text(item.reason),
+        label: text(item.label),
+        pinned: Boolean(item.pinned),
         revision: numberOrZero(item.revision),
         updatedAtLocal: text(item.updatedAtLocal),
         rollCount: Array.isArray(item.payload?.rolls) ? item.payload.rolls.length : 0,
+        approximateBytes: cloudRecordApproximateBytes(item),
       }))
       .sort((a, b) => Date.parse(b.updatedAtLocal || 0) - Date.parse(a.updatedAtLocal || 0));
     app.cloud.historyLoadedAt = Date.now();
   } catch (error) {
     console.error("Não foi possível carregar o historial.", error);
     app.cloud.historyError = "Não foi possível consultar o historial neste momento.";
+    app.cloud.historyUsage = null;
   } finally {
     app.cloud.historyLoading = false;
     if (app.ready && app.activeView === "archive") render();
   }
 }
 
+async function deleteCloudHistoryVersion(id) {
+  if (!id) return;
+  const item = app.cloud.history.find((entry) => entry.id === id);
+  if (!item) {
+    showToast("Esta cópia já não está disponível.");
+    return;
+  }
+  if (item.pinned) {
+    showToast("Este backup está protegido. Desprotege-o antes de eliminar.");
+    return;
+  }
+  const label = item.kind === "weekly" ? formatIsoWeekKey(item.weekKey) : "esta cópia de recuperação";
+  if (!confirm(uiText(`Eliminar ${label} do Firebase? Esta ação não pode ser desfeita.`))) return;
+  await deleteCloudHistoryRecords([id]);
+}
+
+async function nameCloudHistoryVersion(id) {
+  const item = app.cloud.history.find((entry) => entry.id === id);
+  if (!item || !app.cloud.modules) return;
+  const label = prompt(uiText("Nome deste backup:"), item.label || "");
+  if (label == null) return;
+  try {
+    await app.cloud.modules.setDoc(cloudDocumentRef(id), { label: text(label), schemaVersion: SYNC_SCHEMA_VERSION }, { merge: true });
+    app.cloud.historyLoadedAt = 0;
+    await loadCloudHistory({ force: true });
+    showToast(text(label) ? "Nome do backup guardado." : "Nome do backup removido.");
+  } catch (error) {
+    console.error(error);
+    showToast("Não foi possível alterar o nome do backup.");
+  }
+}
+
+async function toggleCloudHistoryPin(id) {
+  const item = app.cloud.history.find((entry) => entry.id === id);
+  if (!item || !app.cloud.modules) return;
+  try {
+    await app.cloud.modules.setDoc(cloudDocumentRef(id), { pinned: !item.pinned, schemaVersion: SYNC_SCHEMA_VERSION }, { merge: true });
+    app.cloud.historyLoadedAt = 0;
+    await loadCloudHistory({ force: true });
+    showToast(item.pinned ? "Backup desprotegido." : "Backup protegido contra eliminação e retenção automática.");
+  } catch (error) {
+    console.error(error);
+    showToast("Não foi possível alterar a proteção do backup.");
+  }
+}
+
+async function deleteAllCloudHistory() {
+  if (!app.cloud.history.length) {
+    showToast("Não existem backups Firebase para eliminar.");
+    return;
+  }
+  if (!confirm(uiText("Eliminar todos os backups não protegidos do Firebase? A versão atual e os backups protegidos serão preservados."))) return;
+  const typed = prompt(uiText("Para confirmar, escreve ELIMINAR."), "");
+  if (text(typed).toUpperCase() !== "ELIMINAR") {
+    showToast("Operação cancelada. Nenhum backup foi eliminado.");
+    return;
+  }
+  await deleteCloudHistoryRecords(null);
+}
+
+async function deleteCloudHistoryRecords(requestedIds) {
+  if (!app.cloud.user || !app.cloud.modules || app.cloud.historyDeleting) return false;
+  app.cloud.historyDeleting = true;
+  render();
+  try {
+    const snapshot = await app.cloud.modules.getDocs(cloudBackupsCollectionRef());
+    const records = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+    const plan = cloudHistoryDeletionPlan(records, requestedIds);
+    if (!plan.removeIds.length) {
+      showToast("Nenhum backup Firebase elegível foi encontrado.");
+      return false;
+    }
+    await Promise.all(plan.removeIds.map((recordId) => app.cloud.modules.deleteDoc(cloudDocumentRef(recordId))));
+    if (plan.weeklyCount) {
+      app.state.meta.lastWeeklyBackupKey = "";
+      app.state.meta.lastWeeklyBackupRevision = 0;
+      app.state.meta.lastRetentionCheckKey = "";
+      app.state.meta.weeklyBackupPending = true;
+      persistState({ skipAutomaticBackup: true, preserveUpdatedAt: true });
+    }
+    await pruneCloudHistory();
+    app.cloud.historyLoadedAt = 0;
+    await loadCloudHistory({ force: true });
+    showToast(plan.removeIds.length === 1
+      ? "Backup Firebase eliminado. A versão atual foi preservada."
+      : `${plan.removeIds.length} backups Firebase eliminados. A versão atual foi preservada.`);
+    return true;
+  } catch (error) {
+    console.error("Não foi possível eliminar os backups Firebase.", error);
+    showToast("Não foi possível eliminar os backups. A versão atual não foi alterada.");
+    return false;
+  } finally {
+    app.cloud.historyDeleting = false;
+    render();
+  }
+}
+
 async function restoreCloudVersion(id) {
   if (!id || !app.cloud.user || !app.cloud.modules) return;
-  const confirmed = confirm(uiText("Repor esta versão? A versão atual ficará guardada como cópia de recuperação."));
-  if (!confirmed) return;
 
   try {
     app.cloud.status = "A preparar a recuperação…";
@@ -5130,6 +6513,13 @@ async function restoreCloudVersion(id) {
       readCloudBackup("current"),
     ]);
     if (!selected?.payload) throw new Error("A cópia selecionada já não existe.");
+    const diff = backupRestoreDiff(app.state, selected.payload);
+    const confirmed = confirm(uiText(`Pré-visualização desta versão:\n${restoreDiffSummary(diff)}\n\nRepor agora? A versão atual ficará guardada como cópia de recuperação.`));
+    if (!confirmed) {
+      app.cloud.status = "Restauro cancelado. A versão atual foi preservada.";
+      render();
+      return;
+    }
     await saveRecoveryCloudBackup(app.state, "antes de repor uma versão anterior");
 
     const restored = normalizeState(selected.payload);
@@ -5153,6 +6543,10 @@ async function restoreCloudVersion(id) {
 }
 
 function toggleAutomaticCloudBackup() {
+  if (isImportedReplacementPending()) {
+    showToast("Conclui primeiro o novo início online para ativar a sincronização automática.");
+    return;
+  }
   const enabled = !app.state.meta.autoCloudBackup;
   app.state.meta.autoCloudBackup = enabled;
   if (enabled) app.state.meta.cloudBackupPending = true;
@@ -5239,12 +6633,8 @@ function csvCell(value) {
 }
 
 function nextRollId(dateValue) {
-  const date = dateValue ? new Date(`${dateValue}T00:00:00`) : new Date();
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const sameMonth = app.state?.rolls?.filter((roll) => String(roll.date || "").startsWith(`${year}-${month}`)).length || 0;
-  const sequence = String(sameMonth + 1).padStart(2, "0");
-  return `${sequence}${month}${year}`;
+  const calendarDate = calendarValueToIso(dateValue) || localCalendarDateToIso(new Date());
+  return nextRollIdForMonth(calendarDate, (app.state?.rolls || []).map((roll) => roll.id));
 }
 
 function normalizeRollId(value) {
@@ -5397,6 +6787,19 @@ function formatHistoryCount(weeklyCount, limit, recoveryCount) {
   return `${weeklyCount} de ${limit} semanas guardadas${recoveryCount ? ` · ${recoveryCount} ${recoveryCount === 1 ? "cópia" : "cópias"} de proteção` : ""}`;
 }
 
+function formatStorageSize(value) {
+  const bytes = Math.max(0, numberOrZero(value));
+  if (bytes < 1024) return `${formatNumber(bytes)} B`;
+  const units = ["KB", "MB", "GB"];
+  let amount = bytes / 1024;
+  let unit = units[0];
+  for (let index = 1; index < units.length && amount >= 1024; index += 1) {
+    amount /= 1024;
+    unit = units[index];
+  }
+  return `${new Intl.NumberFormat(currentLocale(), { maximumFractionDigits: amount < 10 ? 2 : 1 }).format(amount)} ${unit}`;
+}
+
 function formatCurrency(value) {
   return new Intl.NumberFormat(currentLocale(), {
     style: "currency",
@@ -5439,7 +6842,12 @@ function formatDateTime(value) {
 }
 
 function todayStamp() {
-  return new Date().toISOString().slice(0, 10);
+  return localCalendarDateToIso(new Date());
+}
+
+function driveBackupKey(timestamp, weekKey) {
+  const compact = String(timestamp || "").replace(/\D/g, "").padEnd(17, "0").slice(0, 17);
+  return `${weekKey}-${compact.slice(0, 8)}-${compact.slice(8, 14)}-${compact.slice(14)}`;
 }
 
 function escapeHtml(value) {
@@ -5455,13 +6863,46 @@ function escapeAttr(value) {
   return escapeHtml(value);
 }
 
-function showToast(message) {
-  toast.textContent = uiText(message);
+function rememberUndo() {
+  if (!app.state) return;
+  app.undo = {
+    state: structuredClone(app.state),
+    detailId: app.detailId,
+  };
+}
+
+function undoLastChange() {
+  if (!app.undo?.state) {
+    showToast("Já não há uma alteração para desfazer.");
+    return;
+  }
+  const undo = app.undo;
+  app.undo = null;
+  app.state = normalizeState(structuredClone(undo.state));
+  persistState();
+  render();
+  if (detailDialog.open && undo.detailId && findItem("roll", undo.detailId)) {
+    app.detailId = undo.detailId;
+    renderDetails(findItem("roll", undo.detailId));
+  }
+  showToast("Alteração desfeita.");
+}
+
+function showToast(message, options = {}) {
+  const undo = options.undo && app.undo ? app.undo : null;
+  const activeDialog = [dialog, detailDialog, commandDialog].find((candidate) => candidate?.open);
+  const toastHost = activeDialog || document.body;
+  if (toast.parentElement !== toastHost) toastHost.append(toast);
+  toast.innerHTML = `<span>${escapeHtml(uiText(message))}</span>${undo ? `<button type="button" data-action="undo-last-change">${escapeHtml(uiText("Desfazer"))}</button>` : ""}`;
+  toast.classList.toggle("has-action", Boolean(undo));
   toast.classList.add("visible");
   window.clearTimeout(showToast.timeout);
   showToast.timeout = window.setTimeout(() => {
     toast.classList.remove("visible");
-  }, 2400);
+    toast.classList.remove("has-action");
+    if (undo && app.undo === undo) app.undo = null;
+    if (toast.parentElement !== document.body) document.body.append(toast);
+  }, undo ? 12000 : 2400);
 }
 
 function loadLanguagePreference() {

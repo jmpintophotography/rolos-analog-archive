@@ -12,17 +12,30 @@ The project was designed and built with help from OpenAI Codex.
 
 ## Main features
 
+- Universal local search across rolls, stock and equipment, with keyboard shortcuts and quick actions.
+- Read-only smart review for unfinished rolls, missing physical archive locations, incomplete identification and expiring stock.
+- Roll favourites available from the dashboard, review, catalogue, list and detail view.
+- Twelve-second undo for important archive changes, including saves, deletions, status changes and stock consumption.
 - Roll workflow from `In use` to `Archived`.
 - Progressive new-roll form with quick choices for recent cameras, locations and film stock.
+- Quick capture with repeat-last setup, personal templates and save-and-add-another.
+- Touch-friendly wrapping quick-choice grid with no horizontal dragging on mobile.
 - One-step roll loading from stock and `New similar roll` from an existing record.
 - Film stock, expiry dates and packaging images.
+- Optional project, cost and processing-time tracking with stock-value and runway insights.
+- Physical archive batch tools, offline QR labels and QR/manual roll lookup.
 - Camera, lens and accessory catalogue.
 - Search, filters, statistics and location map.
 - Automatic coordinates for new place names when a roll is saved.
 - Portuguese and English interface.
 - JSON, Excel and CSV import/export.
+- Timezone-safe calendar dates, with roll IDs as the definitive month/year reference on import.
+- Protected fresh-start workflow when an imported backup must replace an older Firebase archive.
 - Local storage, optional private Firebase synchronisation and weekly history.
-- Optional weekly Google Drive copy with a 54-week retention limit.
+- Firebase history management with protected deletion controls and an estimated document-usage summary.
+- Non-destructive backup checks, restore previews, named/protected backups and known-device status.
+- Optional manual Google Drive copies, with a weekly reminder and no automatic deletion.
+- Independent timestamped Google Drive files for every manual backup, including multiple copies in one week.
 - Installable Progressive Web App for Android and Windows.
 
 ## Try the demo
@@ -63,7 +76,7 @@ There is no framework or compilation step. Edit the files in `app`, serve that d
 npm test
 ```
 
-The tests validate the demo count, privacy boundaries, release version, translations, geocoding client and offline cache manifest.
+The tests validate the demo count, privacy boundaries, release version, calendar dates in Lisbon and UTC, roll-ID increments, search, review, favourites, undo, translations, geocoding and the offline cache manifest.
 
 ## Location lookup and privacy
 

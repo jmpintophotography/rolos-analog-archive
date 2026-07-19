@@ -3,15 +3,15 @@ window.ROLOS_SEED_DATA = {
     "appName": "Rolos",
     "importedAt": "2026-07-17T12:00:00.000Z",
     "updatedAt": "2026-07-17T12:00:00.000Z",
-    "seedRevision": "2026-07-18-v1.11-demo",
-    "releaseVersion": "1.11",
+    "seedRevision": "2026-07-18-v2.1-demo",
+    "releaseVersion": "2.1",
     "version": 5
   },
   "rolls": [
     {
       "id": "01012026",
       "status": "Arquivado",
-      "date": "2026-01-08",
+      "date": "2026-01-01",
       "shotLocation": "Lisboa",
       "camera": "Demo Rangefinder",
       "lens": "35mm f2",
@@ -35,7 +35,7 @@ window.ROLOS_SEED_DATA = {
     {
       "id": "02012026",
       "status": "Arquivado",
-      "date": "2026-01-24",
+      "date": "2026-01-01",
       "shotLocation": "Paris",
       "camera": "Demo SLR",
       "lens": "50mm f1.8",
@@ -59,7 +59,7 @@ window.ROLOS_SEED_DATA = {
     {
       "id": "01022026",
       "status": "Arquivado",
-      "date": "2026-02-11",
+      "date": "2026-02-01",
       "shotLocation": "Berlin",
       "camera": "Demo Compact",
       "lens": "40mm f2.8",
@@ -83,7 +83,7 @@ window.ROLOS_SEED_DATA = {
     {
       "id": "01032026",
       "status": "Revelado",
-      "date": "2026-03-06",
+      "date": "2026-03-01",
       "shotLocation": "Porto",
       "camera": "Demo TLR",
       "lens": "80mm f3.5",
@@ -107,7 +107,7 @@ window.ROLOS_SEED_DATA = {
     {
       "id": "02032026",
       "status": "Digitalizado",
-      "date": "2026-03-19",
+      "date": "2026-03-01",
       "shotLocation": "Madrid",
       "camera": "Demo Rangefinder",
       "lens": "35mm f2",
@@ -131,7 +131,7 @@ window.ROLOS_SEED_DATA = {
     {
       "id": "01042026",
       "status": "Em Uso",
-      "date": "2026-04-05",
+      "date": "2026-04-01",
       "shotLocation": "London",
       "camera": "Demo SLR",
       "lens": "28mm f2.8",
@@ -155,7 +155,7 @@ window.ROLOS_SEED_DATA = {
     {
       "id": "02042026",
       "status": "Disparado",
-      "date": "2026-04-18",
+      "date": "2026-04-01",
       "shotLocation": "Paris/Lyon",
       "camera": "Demo Compact",
       "lens": "40mm f2.8",
@@ -179,7 +179,7 @@ window.ROLOS_SEED_DATA = {
     {
       "id": "01052026",
       "status": "Em Revelação",
-      "date": "2026-05-03",
+      "date": "2026-05-01",
       "shotLocation": "Rome",
       "camera": "Demo Rangefinder",
       "lens": "50mm f2",
@@ -203,7 +203,7 @@ window.ROLOS_SEED_DATA = {
     {
       "id": "02052026",
       "status": "Editado",
-      "date": "2026-05-21",
+      "date": "2026-05-01",
       "shotLocation": "Copenhagen",
       "camera": "Demo TLR",
       "lens": "80mm f3.5",
@@ -227,7 +227,7 @@ window.ROLOS_SEED_DATA = {
     {
       "id": "01062026",
       "status": "Recolhido",
-      "date": "2026-06-12",
+      "date": "2026-06-01",
       "shotLocation": "Tokyo",
       "camera": "Demo SLR",
       "lens": "50mm f1.8",

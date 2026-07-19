@@ -1,12 +1,27 @@
 {
   "name": "Rolos",
   "short_name": "Rolos",
-  "description": "Arquivo pessoal de fotografia analógica.",
+  "description": "Arquivo pessoal de fotografia analógica com datas seguras, backups controlados e interface móvel otimizada.",
   "start_url": ".",
   "display": "standalone",
   "background_color": "#f4f4f2",
   "theme_color": "#1f1f1f",
   "orientation": "any",
+  "shortcuts": [
+    {
+      "name": "Novo rolo",
+      "short_name": "Novo rolo",
+      "description": "Abrir diretamente o registo de um novo rolo",
+      "url": "./?action=new-roll",
+      "icons": [
+        {
+          "src": "icon.svg",
+          "sizes": "any",
+          "type": "image/svg+xml"
+        }
+      ]
+    }
+  ],
   "icons": [
     {
       "src": "icon.svg",

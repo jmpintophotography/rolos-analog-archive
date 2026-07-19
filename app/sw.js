@@ -1,9 +1,11 @@
-const CACHE_NAME = "rolos-app-v1-11-20260718-qol-r1";
+const CACHE_NAME = "rolos-app-v2-5-20260718-final-r5";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
+  "./v25-core.js",
+  "./calendar-dates.js",
   "./sync-core.js",
   "./drive-backup-core.js",
   "./drive-backup-client.js",

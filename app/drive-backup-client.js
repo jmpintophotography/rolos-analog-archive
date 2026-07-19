@@ -45,41 +45,36 @@ export function createDriveBackupClient(accessToken, options = {}) {
     });
   }
 
-  async function uploadWeeklyBackup(folderId, weekKey, content) {
-    const escapedFolderId = driveQueryLiteral(folderId);
-    const escapedWeekKey = driveQueryLiteral(weekKey);
-    const query = `'${escapedFolderId}' in parents and appProperties has { key='rolosBackupWeek' and value='${escapedWeekKey}' } and trashed=false`;
-    const existing = await listFiles(query);
-    let file = existing[0];
-
-    if (!file) {
-      file = await request(`${DRIVE_API_URL}/files?fields=id,name,webViewLink,createdTime,modifiedTime`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json; charset=UTF-8" },
-        body: JSON.stringify({
-          name: `rolos-backup-${weekKey}.json`,
-          mimeType: "application/json",
-          parents: [folderId],
-          description: "Cópia semanal criada pela aplicação privada Rolos.",
-          appProperties: {
-            rolosBackupKind: DRIVE_FILE_MARKER,
-            rolosBackupWeek: weekKey,
-          },
-        }),
-      });
-    }
+  async function uploadManualBackup(folderId, backupKey, weekKey, content) {
+    const file = await request(`${DRIVE_API_URL}/files?fields=id,name,webViewLink,createdTime,modifiedTime`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=UTF-8" },
+      body: JSON.stringify({
+        name: `rolos-backup-${backupKey}.json`,
+        mimeType: "application/json",
+        parents: [folderId],
+        description: "Cópia manual independente criada pela aplicação privada Rolos.",
+        appProperties: {
+          rolosBackupKind: DRIVE_FILE_MARKER,
+          rolosBackupWeek: weekKey,
+          rolosBackupId: backupKey,
+        },
+      }),
+    });
 
     try {
       if (utf8ByteLength(content) > resumableThresholdBytes) {
-        return await uploadResumableFile(fetchImpl, accessToken, file.id, content);
+        const uploaded = await uploadResumableFile(fetchImpl, accessToken, file.id, content);
+        return { ...file, ...uploaded };
       }
-      return await request(`${DRIVE_UPLOAD_URL}/files/${encodeURIComponent(file.id)}?uploadType=media&fields=id,name,webViewLink,createdTime,modifiedTime`, {
+      const uploaded = await request(`${DRIVE_UPLOAD_URL}/files/${encodeURIComponent(file.id)}?uploadType=media&fields=id,name,webViewLink,createdTime,modifiedTime`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json; charset=UTF-8" },
         body: content,
       });
+      return { ...file, ...uploaded };
     } catch (error) {
-      if (!existing.length && file?.id) {
+      if (file?.id) {
         try {
           await request(`${DRIVE_API_URL}/files/${encodeURIComponent(file.id)}`, { method: "DELETE" });
         } catch (cleanupError) {
@@ -107,7 +102,7 @@ export function createDriveBackupClient(accessToken, options = {}) {
 
   return {
     ensureBackupFolder,
-    uploadWeeklyBackup,
+    uploadManualBackup,
     pruneBackupHistory,
   };
 }

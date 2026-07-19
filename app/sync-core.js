@@ -1,6 +1,12 @@
-export const SYNC_SCHEMA_VERSION = 2;
+export const SYNC_SCHEMA_VERSION = 3;
 export const WEEKLY_BACKUP_LIMIT = 54;
 export const RECOVERY_BACKUP_LIMIT = 10;
+
+export function requiresSyncSchemaUpgrade(record, targetVersion = SYNC_SCHEMA_VERSION) {
+  if (!record?.payload) return false;
+  return positiveInteger(record.schemaVersion) < targetVersion
+    || positiveInteger(record.payload?.meta?.syncSchemaVersion) < targetVersion;
+}
 
 export function stateFingerprint(state = {}) {
   const relevantData = {
@@ -9,6 +15,7 @@ export function stateFingerprint(state = {}) {
     equipment: Array.isArray(state.equipment) ? state.equipment : [],
     filmImages: state.filmImages && typeof state.filmImages === "object" ? state.filmImages : {},
     support: state.support && typeof state.support === "object" ? state.support : {},
+    workflow: state.workflow && typeof state.workflow === "object" ? state.workflow : {},
   };
   return dualHash(canonicalStringify(relevantData));
 }
@@ -88,9 +95,68 @@ export function historyRetentionPlan(records, weeklyLimit = WEEKLY_BACKUP_LIMIT,
   const newestFirst = (a, b) => recordTimestamp(b) - recordTimestamp(a) || String(b.id).localeCompare(String(a.id));
   const weekly = records.filter((record) => record.kind === "weekly").sort(newestFirst);
   const recovery = records.filter((record) => record.kind === "recovery").sort(newestFirst);
+  const pinned = [...weekly, ...recovery].filter((record) => Boolean(record.pinned));
+  const regularWeekly = weekly.filter((record) => !record.pinned);
+  const regularRecovery = recovery.filter((record) => !record.pinned);
   return {
-    keep: [...weekly.slice(0, weeklyLimit), ...recovery.slice(0, recoveryLimit)],
-    remove: [...weekly.slice(weeklyLimit), ...recovery.slice(recoveryLimit)],
+    keep: [...pinned, ...regularWeekly.slice(0, weeklyLimit), ...regularRecovery.slice(0, recoveryLimit)],
+    remove: [...regularWeekly.slice(weeklyLimit), ...regularRecovery.slice(recoveryLimit)],
+  };
+}
+
+export function cloudArchiveResetPlan(records, replacementImageIds = []) {
+  const keepImageIds = new Set(replacementImageIds.map(String));
+  const removable = records.filter((record) => {
+    if (!record?.id || record.id === "current" || record.kind === "drive-status") return false;
+    if (record.kind === "film-image-v2" && keepImageIds.has(String(record.id))) return false;
+    return ["weekly", "recovery", "film-image-v2", "film-image"].includes(String(record.kind || ""))
+      || String(record.id).startsWith("film-image-");
+  });
+  return {
+    removeIds: removable.map((record) => String(record.id)),
+    removedHistory: removable.filter((record) => ["weekly", "recovery"].includes(record.kind)).length,
+    removedImages: removable.filter((record) => String(record.id).startsWith("film-image-")).length,
+  };
+}
+
+export function cloudRecordApproximateBytes(record) {
+  try {
+    const serialized = JSON.stringify(record ?? {});
+    if (typeof TextEncoder === "function") return new TextEncoder().encode(serialized).byteLength;
+    return serialized.length * 2;
+  } catch {
+    return 0;
+  }
+}
+
+export function cloudStorageSummary(records = []) {
+  const normalized = Array.isArray(records) ? records : [];
+  const history = normalized.filter((record) => ["weekly", "recovery"].includes(record?.kind));
+  const images = normalized.filter((record) => ["film-image", "film-image-v2"].includes(record?.kind)
+    || String(record?.id || "").startsWith("film-image-"));
+  const current = normalized.filter((record) => record?.id === "current" || record?.kind === "current");
+  return {
+    documentCount: normalized.length,
+    historyCount: history.length,
+    imageCount: images.length,
+    currentCount: current.length,
+    approximateBytes: normalized.reduce((total, record) => total + cloudRecordApproximateBytes(record), 0),
+    historyBytes: history.reduce((total, record) => total + cloudRecordApproximateBytes(record), 0),
+    imageBytes: images.reduce((total, record) => total + cloudRecordApproximateBytes(record), 0),
+  };
+}
+
+export function cloudHistoryDeletionPlan(records = [], requestedIds = null) {
+  const requested = requestedIds === null ? null : new Set(requestedIds.map(String));
+  const removable = (Array.isArray(records) ? records : []).filter((record) => {
+    if (!record?.id || record.pinned || !["weekly", "recovery"].includes(record.kind)) return false;
+    return requested === null || requested.has(String(record.id));
+  });
+  return {
+    removeIds: removable.map((record) => String(record.id)),
+    weeklyCount: removable.filter((record) => record.kind === "weekly").length,
+    recoveryCount: removable.filter((record) => record.kind === "recovery").length,
+    approximateBytes: removable.reduce((total, record) => total + cloudRecordApproximateBytes(record), 0),
   };
 }
 

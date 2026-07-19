@@ -12,9 +12,8 @@ service cloud.firestore {
     match /users/{userId}/backups/{docId} {
       allow read: if isOwner(userId);
       allow create, update: if isOwner(userId)
-        && request.resource.data.schemaVersion == 2;
+        && request.resource.data.schemaVersion == 3;
       allow delete: if isOwner(userId);
     }
   }
 }
-

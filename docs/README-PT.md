@@ -19,8 +19,13 @@ O projeto foi pensado e desenvolvido com a ajuda do OpenAI Codex.
 - Posicionamento automático de novos locais ao guardar um rolo.
 - Interface em português e inglês.
 - Importação e exportação em JSON, Excel e CSV.
+- Datas de calendário protegidas contra mudanças de fuso horário; na importação, o mês e o ano do ID do rolo são definitivos.
+- Novo início protegido para substituir uma base Firebase antiga depois de importar um backup.
 - Dados locais e sincronização privada opcional com Firebase.
+- Gestão do historial Firebase na própria aplicação, com eliminação protegida e estimativa de espaço.
 - Histórico semanal e cópia opcional para o Google Drive.
+- Cada cópia manual no Google Drive cria um ficheiro independente, mesmo na mesma semana.
+- Escolhas rápidas do novo rolo organizadas numa grelha tátil, sem arrastar lateralmente.
 - Instalação como app no Android e no Windows.
 
 ## Base de demonstração
