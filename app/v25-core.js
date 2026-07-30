@@ -108,6 +108,8 @@ export function backupRestoreDiff(current = {}, candidate = {}) {
     changed,
     stockDelta: stockQuantity(candidate.stock) - stockQuantity(current.stock),
     equipmentDelta: arrayLength(candidate.equipment) - arrayLength(current.equipment),
+    costProductDelta: arrayLength(candidate.costCenter?.products) - arrayLength(current.costCenter?.products),
+    costSessionDelta: arrayLength(candidate.costCenter?.sessions) - arrayLength(current.costCenter?.sessions),
     candidateIntegrity: archiveIntegrityReport(candidate),
   };
 }

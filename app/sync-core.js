@@ -1,4 +1,4 @@
-export const SYNC_SCHEMA_VERSION = 3;
+export const SYNC_SCHEMA_VERSION = 4;
 export const WEEKLY_BACKUP_LIMIT = 54;
 export const RECOVERY_BACKUP_LIMIT = 10;
 
@@ -13,6 +13,7 @@ export function stateFingerprint(state = {}) {
     rolls: Array.isArray(state.rolls) ? state.rolls : [],
     stock: Array.isArray(state.stock) ? state.stock : [],
     equipment: Array.isArray(state.equipment) ? state.equipment : [],
+    costCenter: state.costCenter && typeof state.costCenter === "object" ? state.costCenter : {},
     filmImages: state.filmImages && typeof state.filmImages === "object" ? state.filmImages : {},
     support: state.support && typeof state.support === "object" ? state.support : {},
     workflow: state.workflow && typeof state.workflow === "object" ? state.workflow : {},

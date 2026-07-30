@@ -48,6 +48,23 @@ import {
   rollCost,
   stockForecast,
 } from "./v25-core.js";
+import {
+  COST_CATEGORIES,
+  COST_UNITS,
+  allocatedCostForRoll,
+  costCenterIntegrityReport,
+  costCenterSummary,
+  normalizeCostCenter,
+  productUsage,
+  rollTotalCost,
+  sessionCost,
+} from "./cost-center-core.js";
+import {
+  applicationIntegrityReport,
+  assertApplicationIntegrity,
+  recordChangedSinceOpen,
+  remapRollIdReferences,
+} from "./integrity-core.js";
 
 const STORAGE_KEY = "rolos-app-state-v1";
 const UI_STORAGE_KEY = "rolos-app-ui-v4";
@@ -55,7 +72,7 @@ const DEVICE_STORAGE_KEY = "rolos-app-device-v1";
 const DRIVE_STATUS_STORAGE_KEY = "rolos-drive-backup-status-v1";
 const LANGUAGE_STORAGE_KEY = "rolos-app-language-v1";
 const IMPORT_REPLACEMENT_STORAGE_KEY = "rolos-import-replacement-pending-v1";
-const RELEASE_VERSION = "2.5";
+const RELEASE_VERSION = "2.8.1";
 const SEED_REVISION = "2026-07-18-v2.1";
 const FIREBASE_VERSION = "10.12.5";
 const XLSX_CDN_URL = "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js";
@@ -118,6 +135,10 @@ const views = {
     title: "Equipamento",
     kicker: "Câmaras, lentes e acessórios",
   },
+  costs: {
+    title: "Centro de custos",
+    kicker: "Custos reais sem contas manuais",
+  },
   review: {
     title: "Revisão",
     kicker: "O que merece atenção",
@@ -141,7 +162,7 @@ const defaultSupport = {
   ],
   filmBrands: [],
   equipmentKinds: ["Câmara", "Lente", "Flash", "Acessório"],
-  equipmentStatuses: ["Funcional", "Vendido", "Avariado", "Emprestado"],
+  equipmentStatuses: ["Funcional", "Vendido", "Abatido", "Avariado", "Emprestado"],
 };
 
 const app = {
@@ -177,6 +198,9 @@ const app = {
     equipmentKind: "",
     equipmentStatus: "",
     equipmentSort: "name",
+    costSearch: "",
+    costCategory: "",
+    costSessionStatus: "",
   },
   viewModes: {
     rolls: "catalog",
@@ -191,6 +215,9 @@ const app = {
   physicalSelection: new Set(),
   physicalSearch: "",
   dashboardFilter: "open",
+  showRetiredEquipment: false,
+  costEditor: null,
+  integrityBlocked: false,
   rollLimit: 50,
   startupWarning: "",
   leafletMap: null,
@@ -252,6 +279,10 @@ const detailPrimaryAction = document.querySelector("#detail-primary-action");
 const commandDialog = document.querySelector("#command-dialog");
 const commandSearch = document.querySelector("#command-search");
 const commandResults = document.querySelector("#command-results");
+const costProductDialog = document.querySelector("#cost-product-dialog");
+const costProductForm = document.querySelector("#cost-product-form");
+const costSessionDialog = document.querySelector("#cost-session-dialog");
+const costSessionForm = document.querySelector("#cost-session-form");
 const toast = document.querySelector("#toast");
 const languageToggle = document.querySelector("#language-toggle");
 
@@ -264,7 +295,16 @@ async function init() {
   const accessGranted = await requirePrivateAccess();
   if (!accessGranted) return;
   bindEvents();
-  app.state = normalizeState(await loadState());
+  const loadedState = await loadState();
+  const loadedReport = applicationIntegrityReport(loadedState);
+  app.state = normalizeState(loadedState);
+  const normalizedReport = applicationIntegrityReport(app.state);
+  app.integrityBlocked = !loadedReport.ok || !normalizedReport.ok;
+  if (app.integrityBlocked) {
+    app.state.meta.autoCloudBackup = false;
+    app.state.meta.cloudBackupPending = false;
+    app.startupWarning = `A sincronização foi pausada porque a verificação encontrou ${Math.max(loadedReport.errorCount, normalizedReport.errorCount)} problemas. Os dados locais foram preservados; abre Backup → Confiança nos dados.`;
+  }
   app.state.meta.releaseVersion = RELEASE_VERSION;
   app.cloud.driveStatus = loadLocalDriveBackupStatus();
   loadUiPreferences();
@@ -530,6 +570,14 @@ function bindEvents() {
   editorFields.addEventListener("input", refreshComputedFields);
   editorFields.addEventListener("change", refreshComputedFields);
   editorForm.addEventListener("submit", saveEditor);
+  costProductForm?.addEventListener("submit", saveCostProduct);
+  costSessionForm?.addEventListener("submit", saveCostSession);
+  costProductForm?.addEventListener("change", (event) => {
+    if (event.target?.name === "costingMode") updateCostProductCapacityUi();
+  });
+  costSessionForm?.addEventListener("input", (event) => {
+    if (event.target?.matches?.("[data-cost-roll-search]")) filterCostRollPicker(event.target.value);
+  });
   commandSearch?.addEventListener("input", handleCommandInput);
   commandSearch?.addEventListener("keydown", handleCommandKeydown);
   document.addEventListener("keydown", handleGlobalKeydown);
@@ -616,6 +664,9 @@ function mergeSeedUpgrade(localState, seedState) {
       ...(seedState.equipment || []),
       ...(localState.equipment || []).filter((item) => item.createdFrom !== "excel" && !seedEquipmentIds.has(item.id)),
     ],
+    costCenter: Object.prototype.hasOwnProperty.call(seedState, "costCenter")
+      ? normalizeCostCenter(seedState.costCenter)
+      : normalizeCostCenter(localState.costCenter),
     filmImages: localState.filmImages || {},
     locationCoordinates: localState.locationCoordinates || {},
     workflow: normalizeV25Workspace(localState.workflow),
@@ -646,6 +697,7 @@ function seedForCurrentMode(seed) {
     rolls: [],
     stock: [],
     equipment: [],
+    costCenter: normalizeCostCenter(),
     filmImages: {},
     locationCoordinates: {},
     workflow: normalizeV25Workspace(),
@@ -700,12 +752,13 @@ function normalizeState(raw) {
       updatedAt: new Date().toISOString(),
       ...(raw.meta || {}),
       ...normalizeCloudBackupMeta(raw.meta),
-      version: 5,
+      version: 6,
       releaseVersion: RELEASE_VERSION,
     },
     rolls: Array.isArray(raw.rolls) ? raw.rolls : [],
     stock: Array.isArray(raw.stock) ? raw.stock : [],
     equipment: Array.isArray(raw.equipment) ? raw.equipment : [],
+    costCenter: normalizeCostCenter(raw.costCenter),
     filmImages: raw.filmImages && typeof raw.filmImages === "object" ? raw.filmImages : {},
     locationCoordinates: normalizeLocationCoordinates(raw.locationCoordinates),
     workflow: normalizeV25Workspace(raw.workflow),
@@ -816,6 +869,31 @@ function normalizeState(raw) {
   return state;
 }
 
+function normalizeValidatedState(raw, sourceLabel = "arquivo") {
+  const normalized = normalizeState(raw);
+  assertApplicationIntegrity(normalized, sourceLabel);
+  return normalized;
+}
+
+function currentEditorRecordIsSafe(collection, id, original) {
+  if (!id) return true;
+  const current = app.state[collection]?.find((item) => item.id === id);
+  if (!current) {
+    showToast("Este registo já não existe. A edição não foi aplicada.");
+    return false;
+  }
+  if (recordChangedSinceOpen(current, original)) {
+    showToast("Este registo mudou noutro dispositivo. Fecha e volta a abrir para não substituir informação recente.");
+    return false;
+  }
+  return true;
+}
+
+function integrityErrorMessage(error, fallback = "Os dados não passaram na verificação de segurança.") {
+  if (error?.code === "rolos/integrity-validation") return error.message;
+  return fallback;
+}
+
 function persistState(options = {}) {
   if (!options.preserveUpdatedAt) {
     app.state.meta.updatedAt = new Date().toISOString();
@@ -916,6 +994,7 @@ function render() {
     stock: renderStockCollection,
     packaging: renderPackagingCollection,
     equipment: renderEquipmentCollection,
+    costs: renderCostCenter,
     review: renderReview,
     archive: renderArchive,
   };
@@ -954,7 +1033,12 @@ function uiIcon(name) {
 }
 
 function renderProfessionalDashboard() {
-  if (isPrivateAccessRequired() && !app.state.rolls.length && !app.state.stock.length && !app.state.equipment.length) {
+  if (isPrivateAccessRequired()
+    && !app.state.rolls.length
+    && !app.state.stock.length
+    && !app.state.equipment.length
+    && !app.state.costCenter.products.length
+    && !app.state.costCenter.sessions.length) {
     return renderPrivateInitialization();
   }
 
@@ -1388,6 +1472,7 @@ function renderStats() {
   const statsRolls = getStatsRolls();
   const stats = getStats(statsRolls);
   const finances = financialSummary(statsRolls, app.state.stock);
+  const costFinances = costCenterSummary(app.state.costCenter, statsRolls);
   const durations = processingDurationSummary(statsRolls);
   const forecast = stockForecast(app.state.stock, app.state.rolls);
   return `
@@ -1408,6 +1493,7 @@ function renderStats() {
     ${patternInsights(stats)}
 
     ${renderV25OperationalInsights(stats, finances, durations, forecast)}
+    ${renderCostCenterStats(costFinances)}
 
     <section class="panel">
       <div class="panel-header">
@@ -1497,6 +1583,38 @@ function renderStats() {
   `;
 }
 
+function renderCostCenterStats(summary) {
+  if (!summary.products && !summary.sessions && !summary.drafts) return "";
+  return `
+    <section class="panel cost-stats-panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <p class="section-eyebrow">Centro de custos</p>
+          <h3>Análise financeira real</h3>
+          <span class="panel-subtitle">Compras, consumo e comparação entre casa e laboratório</span>
+        </div>
+        <button class="button secondary compact-button" type="button" data-action="go-view" data-view="costs">${uiIcon("circle-dollar-sign")}<span>Abrir centro de custos</span></button>
+      </div>
+      <div class="v25-metric-grid">
+        ${metric("Investimento registado", formatCurrency(summary.purchaseSpend), `${formatNumber(summary.products)} compras`)}
+        ${metric("Custo consumido", formatCurrency(summary.consumedValue), `${formatNumber(summary.sessions)} sessões`)}
+        ${metric("Média por rolo", formatCurrency(summary.averagePerRoll), `${formatNumber(summary.allocatedRolls)} rolos imputados`)}
+        ${metric("Valor disponível", formatCurrency(summary.remainingValue), "químicos e consumíveis")}
+      </div>
+      <div class="dashboard-grid">
+        <div>
+          <h4>Custos por mês</h4>
+          ${summary.byMonth.size ? barChart(summary.byMonth, { maxItems: 12 }) : emptyState("Conclui sessões para iniciar esta análise.")}
+        </div>
+        <div>
+          <h4>Custos por categoria</h4>
+          ${summary.byCategory.size ? barChart(summary.byCategory, { maxItems: 12, alt: true }) : emptyState("Regista utilização de produtos para ver as categorias.")}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
 function renderV25OperationalInsights(stats, finances, durations, forecast) {
   const completionRate = stats.totalRolls ? Math.round((stats.archivedRolls / stats.totalRolls) * 100) : 0;
   const byProject = countBy(getStatsRolls(), (roll) => roll.project || "Sem projeto");
@@ -1504,7 +1622,7 @@ function renderV25OperationalInsights(stats, finances, durations, forecast) {
     <section class="panel v25-insights-panel">
       <div class="panel-header">
         <div class="panel-title">
-          <p class="section-eyebrow">Operação v2.5</p>
+          <p class="section-eyebrow">Operação v2.8.1</p>
           <h3>Custos, tempos e previsão</h3>
           <span class="panel-subtitle">Os registos antigos continuam válidos; as médias usam apenas os campos preenchidos</span>
         </div>
@@ -1957,7 +2075,7 @@ function filmPackageCard(film) {
   const isCustomImage = imageMatch?.source === "custom";
   const palette = filmPalette(film.brand);
   const image = imageSrc
-    ? `<img src="${escapeAttr(imageSrc)}" alt="Embalagem de ${escapeAttr(filmDisplayName(film))}">`
+    ? `<img src="${escapeAttr(imageSrc)}" alt="Embalagem de ${escapeAttr(filmDisplayName(film))}" loading="lazy" decoding="async">`
     : `
       <div class="film-package-art" style="--film-accent:${palette.accent};--film-deep:${palette.deep};--film-paper:${palette.paper}" role="img" aria-label="Capa automática de ${escapeAttr(filmDisplayName(film))}">
         <span class="film-package-brand">${escapeHtml(film.brand || "Filme")}</span>
@@ -2058,6 +2176,57 @@ function filmCatalogValueMatches(value, options) {
     .some((option) => normalizeSearchValue(option).replace(/[^a-z0-9]+/g, "") === comparable);
 }
 
+function findBuiltInEquipmentImage(item) {
+  const catalog = Array.isArray(globalThis.ROLOS_BUILT_IN_EQUIPMENT_IMAGES)
+    ? globalThis.ROLOS_BUILT_IN_EQUIPMENT_IMAGES
+    : [];
+  return catalog.find((entry) => {
+    const kindOptions = Array.isArray(entry.kinds) ? entry.kinds : [];
+    const kindMatches = !text(item?.kind)
+      || !kindOptions.length
+      || filmCatalogValueMatches(item.kind, kindOptions);
+    const brandMatches = filmCatalogValueMatches(item?.brand, entry.brands || [entry.brand]);
+    const modelMatches = filmCatalogValueMatches(item?.model, entry.models || [entry.model]);
+    return kindMatches && brandMatches && modelMatches && text(entry.src);
+  }) || null;
+}
+
+function equipmentImageForItem(item) {
+  return findBuiltInEquipmentImage(item)?.src || "";
+}
+
+function findEquipmentImageForRoll(label, expectedKind) {
+  const comparableLabel = normalizeSearchValue(label).replace(/[^a-z0-9]+/g, "");
+  if (!comparableLabel) return null;
+
+  const equipment = Array.isArray(app.state?.equipment) ? app.state.equipment : [];
+  const item = equipment.find((candidate) => {
+    const kindMatches = !expectedKind || filmCatalogValueMatches(candidate.kind, expectedKind);
+    const comparableModel = normalizeSearchValue(candidate.model).replace(/[^a-z0-9]+/g, "");
+    const comparableFullName = normalizeSearchValue(`${candidate.brand || ""} ${candidate.model || ""}`)
+      .replace(/[^a-z0-9]+/g, "");
+    return kindMatches && (comparableLabel === comparableModel || comparableLabel === comparableFullName);
+  });
+  if (item) {
+    const image = findBuiltInEquipmentImage(item);
+    if (image) return { ...image, label: `${item.brand || ""} ${item.model || ""}`.trim() };
+  }
+
+  const catalog = Array.isArray(globalThis.ROLOS_BUILT_IN_EQUIPMENT_IMAGES)
+    ? globalThis.ROLOS_BUILT_IN_EQUIPMENT_IMAGES
+    : [];
+  const direct = catalog.find((entry) => {
+    const kindMatches = !expectedKind
+      || (entry.kinds || []).some((kind) => expectedKind.some((option) => filmCatalogValueMatches(kind, [option])));
+    const names = [
+      ...(entry.models || []),
+      ...((entry.brands || []).flatMap((brand) => (entry.models || []).map((model) => `${brand} ${model}`))),
+    ];
+    return kindMatches && names.some((name) => normalizeSearchValue(name).replace(/[^a-z0-9]+/g, "") === comparableLabel);
+  });
+  return direct ? { ...direct, label: text(label) } : null;
+}
+
 function comparableFilmReferenceKey(film) {
   return [
     film.brand || film.filmBrand,
@@ -2117,10 +2286,649 @@ function filmPalette(brand) {
   return fallbacks[hashString(key) % fallbacks.length];
 }
 
+function openCostProduct(id = null) {
+  const existing = id ? app.state.costCenter.products.find((item) => item.id === id) : null;
+  if (id && !existing) {
+    showToast("Não encontrei essa compra.");
+    return;
+  }
+  const item = existing ? structuredClone(existing) : {
+    id: createId("custo"),
+    name: "",
+    category: "Revelador",
+    brand: "",
+    purchaseDate: localCalendarDateToIso(new Date()),
+    purchaseCost: 0,
+    costingMode: "quantity",
+    capacity: 0,
+    unit: "ml",
+    status: "active",
+    notes: "",
+    createdAt: new Date().toISOString(),
+    updatedAt: "",
+    finishedAt: "",
+  };
+  app.costEditor = {
+    type: "product",
+    id,
+    item,
+    original: existing ? structuredClone(existing) : null,
+  };
+  document.querySelector("#cost-product-title").textContent = id ? "Editar compra" : "Nova compra";
+  document.querySelector("#delete-cost-product-button").hidden = !id;
+  document.querySelector("#cost-product-fields").innerHTML = `
+    <div class="cost-form-intro">
+      ${uiIcon("sparkles")}
+      <span><strong>Só precisas de indicar o custo e a capacidade.</strong><small>Podes medir em ml, gramas, unidades ou simplesmente no número de rolos que esperas tratar.</small></span>
+    </div>
+    <div class="form-grid">
+      ${costInput("name", "Produto", item.name, { required: true, placeholder: "Ex.: Rodinal 500 ml" })}
+      ${costSelect("category", "Categoria", COST_CATEGORIES, item.category)}
+      ${costInput("brand", "Marca", item.brand, { placeholder: "Opcional" })}
+      ${costInput("purchaseDate", "Data de compra", item.purchaseDate, { type: "date" })}
+      ${costInput("purchaseCost", "Custo total (€)", item.purchaseCost, { type: "number", min: 0, step: "0.01", required: true })}
+      ${costSelectOptions("costingMode", "Como queres controlar", [
+        ["quantity", "Por quantidade usada"],
+        ["rolls", "Pelo número de rolos"],
+      ], item.costingMode)}
+      ${costInput("capacity", "Quantidade comprada", item.capacity, { type: "number", min: 0.001, step: "0.001", required: true, wrapper: "cost-capacity-field" })}
+      ${costSelect("unit", "Unidade", COST_UNITS, item.unit, { wrapper: "cost-unit-field" })}
+      ${costSelectOptions("productStatus", "Estado", [["active", "Ativo"], ["finished", "Terminado"]], item.status)}
+      <div class="field full">
+        <label for="cost-product-notes">Notas</label>
+        <textarea id="cost-product-notes" name="notes" placeholder="Diluição, validade, lote ou outra informação útil">${escapeHtml(item.notes)}</textarea>
+      </div>
+    </div>
+  `;
+  updateCostProductCapacityUi();
+  costProductDialog.showModal();
+  refreshIcons();
+}
+
+function updateCostProductCapacityUi() {
+  if (!costProductForm) return;
+  const rollsMode = costProductForm.elements.costingMode?.value === "rolls";
+  const label = costProductForm.querySelector(".cost-capacity-field label");
+  const unitField = costProductForm.querySelector(".cost-unit-field");
+  if (label) label.textContent = rollsMode ? "Rolos estimados até acabar" : "Quantidade comprada";
+  if (unitField) unitField.hidden = rollsMode;
+}
+
+function saveCostProduct(event) {
+  event.preventDefault();
+  if (app.costEditor?.type !== "product") return;
+  const form = new FormData(costProductForm);
+  const now = new Date().toISOString();
+  const mode = form.get("costingMode") === "rolls" ? "rolls" : "quantity";
+  const purchaseCost = Number(form.get("purchaseCost"));
+  const capacity = Number(form.get("capacity"));
+  if (!Number.isFinite(purchaseCost) || purchaseCost < 0) {
+    showToast("O custo total deve ser zero ou positivo.");
+    costProductForm.elements.purchaseCost?.focus();
+    return;
+  }
+  if (!Number.isFinite(capacity) || capacity <= 0) {
+    showToast("Indica uma quantidade ou um número estimado de rolos superior a zero.");
+    costProductForm.elements.capacity?.focus();
+    return;
+  }
+  const item = {
+    ...app.costEditor.item,
+    name: text(form.get("name")),
+    category: text(form.get("category")) || "Outro",
+    brand: text(form.get("brand")),
+    purchaseDate: text(form.get("purchaseDate")),
+    purchaseCost,
+    costingMode: mode,
+    capacity,
+    unit: mode === "rolls" ? "rolo" : (text(form.get("unit")) || "unidade"),
+    status: form.get("productStatus") === "finished" ? "finished" : "active",
+    notes: text(form.get("notes")),
+    updatedAt: now,
+  };
+  if (!item.name) {
+    costProductForm.elements.name?.focus();
+    return;
+  }
+  item.finishedAt = item.status === "finished"
+    ? (app.costEditor.item.finishedAt || now)
+    : "";
+  if (app.costEditor.id) {
+    const current = app.state.costCenter.products.find((candidate) => candidate.id === app.costEditor.id);
+    if (!current || recordChangedSinceOpen(current, app.costEditor.original)) {
+      showToast("Esta compra mudou noutro dispositivo. Fecha e volta a abrir antes de guardar.");
+      return;
+    }
+    const used = productUsage(current, app.state.costCenter.sessions).used;
+    if (item.capacity < used) {
+      showToast(`Já foram registados ${formatCostQuantity(used, current.unit)}. A capacidade não pode ficar abaixo desse valor.`);
+      costProductForm.elements.capacity?.focus();
+      return;
+    }
+  }
+  let candidate = structuredClone(app.state);
+  if (app.costEditor.id) {
+    const index = candidate.costCenter.products.findIndex((current) => current.id === app.costEditor.id);
+    candidate.costCenter.products[index] = item;
+  } else {
+    candidate.costCenter.products.push(item);
+  }
+  try {
+    candidate = normalizeValidatedState(candidate, "compra do Centro de Custos");
+  } catch (error) {
+    console.error(error);
+    showToast(integrityErrorMessage(error));
+    return;
+  }
+  rememberUndo();
+  app.state = candidate;
+  persistState();
+  closeCostProduct();
+  render();
+  showToast("Compra guardada.", { undo: true });
+}
+
+function closeCostProduct() {
+  if (costProductDialog?.open) costProductDialog.close();
+  app.costEditor = null;
+}
+
+function finishCostProduct(id) {
+  const item = app.state.costCenter.products.find((candidate) => candidate.id === id);
+  if (!item) return;
+  rememberUndo();
+  item.status = "finished";
+  item.finishedAt = new Date().toISOString();
+  item.updatedAt = item.finishedAt;
+  app.state = normalizeState(app.state);
+  persistState();
+  render();
+  showToast(`${item.name} marcado como terminado.`, { undo: true });
+}
+
+function deleteCostProduct() {
+  const id = app.costEditor?.type === "product" ? app.costEditor.id : "";
+  if (!id) return;
+  const current = app.state.costCenter.products.find((item) => item.id === id);
+  if (!current || recordChangedSinceOpen(current, app.costEditor.original)) {
+    showToast("Esta compra mudou entretanto. Fecha e volta a abrir antes de eliminar.");
+    return;
+  }
+  const referenced = app.state.costCenter.sessions.some((session) =>
+    session.consumptions.some((item) => item.productId === id));
+  if (referenced) {
+    showToast("Esta compra já foi usada numa sessão. Marca-a como terminada para preservar as contas.");
+    return;
+  }
+  if (!confirm(uiText("Eliminar esta compra?"))) return;
+  rememberUndo();
+  app.state.costCenter.products = app.state.costCenter.products.filter((item) => item.id !== id);
+  app.state = normalizeState(app.state);
+  persistState();
+  closeCostProduct();
+  render();
+  showToast("Compra eliminada.", { undo: true });
+}
+
+function openCostSession(id = null) {
+  const existing = id ? app.state.costCenter.sessions.find((item) => item.id === id) : null;
+  if (id && !existing) {
+    showToast("Não encontrei essa sessão.");
+    return;
+  }
+  const item = existing ? structuredClone(existing) : {
+    id: createId("sessao"),
+    date: localCalendarDateToIso(new Date()),
+    title: "",
+    method: "home",
+    provider: "",
+    status: "completed",
+    rollIds: [],
+    consumptions: [],
+    directCost: 0,
+    notes: "",
+    createdAt: new Date().toISOString(),
+    updatedAt: "",
+    completedAt: "",
+  };
+  app.costEditor = {
+    type: "session",
+    id,
+    item,
+    original: existing ? structuredClone(existing) : null,
+  };
+  const selected = new Set(item.rollIds);
+  const consumptionByProduct = new Map(item.consumptions.map((line) => [line.productId, line.amount]));
+  const rolls = sortRolls(app.state.rolls);
+  const products = [...app.state.costCenter.products]
+    .filter((product) => product.status === "active" || consumptionByProduct.has(product.id))
+    .sort((a, b) => localeSort(a.category, b.category) || localeSort(a.name, b.name));
+  document.querySelector("#cost-session-title").textContent = id ? "Editar sessão" : "Nova sessão";
+  document.querySelector("#delete-cost-session-button").hidden = !id;
+  document.querySelector("#cost-session-fields").innerHTML = `
+    <div class="cost-form-intro">
+      ${uiIcon("calculator")}
+      <span><strong>Escolhe os rolos e regista o que foi usado.</strong><small>O custo total é dividido automaticamente e aparece no detalhe de cada rolo.</small></span>
+    </div>
+    <div class="form-grid">
+      ${costInput("date", "Data", item.date, { type: "date", required: true })}
+      ${costInput("title", "Nome da sessão", item.title, { placeholder: "Ex.: Revelação de julho" })}
+      ${costSelectOptions("method", "Tipo", [
+        ["home", "Revelação em casa"],
+        ["lab", "Laboratório externo"],
+        ["other", "Outro custo"],
+      ], item.method)}
+      ${costInput("provider", "Loja ou fornecedor", item.provider, { placeholder: "Opcional" })}
+      ${costInput("directCost", "Serviço ou custo extra (€)", item.directCost, { type: "number", min: 0, step: "0.01" })}
+      ${costSelectOptions("sessionStatus", "Estado", [["completed", "Concluída"], ["draft", "Rascunho"]], item.status)}
+    </div>
+
+    <section class="cost-form-section">
+      <div class="cost-form-section-title">
+        <div><h3>Rolos tratados</h3><p>Podes escolher um ou vários. A pesquisa não altera as escolhas já feitas.</p></div>
+        <span>${formatNumber(selected.size)} selecionados</span>
+      </div>
+      <label class="cost-roll-search">${uiIcon("search")}<input type="search" data-cost-roll-search placeholder="Pesquisar ID, câmara ou filme"></label>
+      <div class="cost-roll-picker">
+        ${rolls.map((roll) => `
+          <label data-cost-roll-option data-search="${escapeAttr(normalizeSearchValue([roll.id, roll.camera, filmName(roll), roll.status].join(" ")))}">
+            <input type="checkbox" name="rollIds" value="${escapeAttr(roll.id)}" ${selected.has(roll.id) ? "checked" : ""}>
+            <span><strong>${escapeHtml(roll.id)}</strong><small>${escapeHtml(roll.camera || "Sem câmara")} · ${escapeHtml(filmName(roll) || "Sem filme")} · ${escapeHtml(roll.status || "Sem estado")}</small></span>
+          </label>
+        `).join("")}
+      </div>
+    </section>
+
+    <section class="cost-form-section">
+      <div class="cost-form-section-title">
+        <div><h3>Produtos usados</h3><p>Deixa a zero o que não foi utilizado nesta sessão.</p></div>
+      </div>
+      <div class="cost-consumption-list">
+        ${products.length ? products.map((product) => {
+          const usage = productUsage(product, app.state.costCenter.sessions);
+          const amount = consumptionByProduct.get(product.id) || "";
+          return `
+            <label>
+              <span><strong>${escapeHtml(product.name)}</strong><small>${escapeHtml(product.category)} · ${formatCostQuantity(usage.remaining, usage.unit)} disponíveis</small></span>
+              <span class="cost-consumption-input"><input type="number" name="consumption-${escapeAttr(product.id)}" value="${escapeAttr(amount)}" min="0" step="0.001" placeholder="0"><small>${escapeHtml(product.unit)}</small></span>
+            </label>
+          `;
+        }).join("") : emptyState("Primeiro regista uma compra para imputar químicos ou consumíveis.")}
+      </div>
+    </section>
+
+    <div class="field full">
+      <label for="cost-session-notes">Notas</label>
+      <textarea id="cost-session-notes" name="notes" placeholder="Diluição, tempos, processo ou observações">${escapeHtml(item.notes)}</textarea>
+    </div>
+  `;
+  costSessionDialog.showModal();
+  refreshIcons();
+}
+
+function filterCostRollPicker(value) {
+  const query = normalizeSearchValue(value);
+  costSessionForm?.querySelectorAll("[data-cost-roll-option]").forEach((option) => {
+    option.hidden = Boolean(query) && !String(option.dataset.search || "").includes(query);
+  });
+}
+
+function saveCostSession(event) {
+  event.preventDefault();
+  if (app.costEditor?.type !== "session") return;
+  const form = new FormData(costSessionForm);
+  const now = new Date().toISOString();
+  const rollIds = unique([...costSessionForm.querySelectorAll('input[name="rollIds"]:checked')].map((input) => input.value));
+  const consumptions = [];
+  for (const product of app.state.costCenter.products) {
+    const input = costSessionForm.elements.namedItem(`consumption-${product.id}`);
+    const rawAmount = text(input?.value);
+    if (!rawAmount) continue;
+    const amount = Number(rawAmount);
+    if (!Number.isFinite(amount) || amount < 0) {
+      showToast(`A quantidade usada de ${product.name} não pode ser negativa.`);
+      input?.focus();
+      return;
+    }
+    if (amount > 0) consumptions.push({ productId: product.id, amount });
+  }
+  const directCost = Number(form.get("directCost") || 0);
+  if (!Number.isFinite(directCost) || directCost < 0) {
+    showToast("O custo direto deve ser zero ou positivo.");
+    costSessionForm.elements.directCost?.focus();
+    return;
+  }
+  const item = {
+    ...app.costEditor.item,
+    date: text(form.get("date")),
+    title: text(form.get("title")),
+    method: text(form.get("method")),
+    provider: text(form.get("provider")),
+    status: form.get("sessionStatus") === "draft" ? "draft" : "completed",
+    rollIds,
+    consumptions,
+    directCost,
+    notes: text(form.get("notes")),
+    updatedAt: now,
+  };
+  item.completedAt = item.status === "completed"
+    ? (app.costEditor.item.completedAt || now)
+    : "";
+  if (!item.date) {
+    showToast("Indica a data da sessão.");
+    return;
+  }
+  const previewCost = sessionCost({ ...item, status: "completed" }, app.state.costCenter.products);
+  if (item.status === "completed" && previewCost <= 0) {
+    showToast("Indica pelo menos um produto usado ou um custo direto.");
+    return;
+  }
+  if (item.status === "completed" && !item.rollIds.length
+    && !confirm(uiText("Esta sessão não tem rolos escolhidos. Guardar como custo geral sem imputação por rolo?"))) {
+    return;
+  }
+  if (app.costEditor.id) {
+    const current = app.state.costCenter.sessions.find((candidate) => candidate.id === app.costEditor.id);
+    if (!current || recordChangedSinceOpen(current, app.costEditor.original)) {
+      showToast("Esta sessão mudou noutro dispositivo. Fecha e volta a abrir antes de guardar.");
+      return;
+    }
+  }
+  const knownRollIds = new Set(app.state.rolls.map((roll) => roll.id));
+  const missingRollId = item.rollIds.find((id) => !knownRollIds.has(id));
+  if (missingRollId) {
+    showToast(`O rolo ${missingRollId} já não existe. Atualiza a sessão antes de guardar.`);
+    return;
+  }
+  if (item.status === "completed") {
+    const otherSessions = app.state.costCenter.sessions.filter((session) => session.id !== app.costEditor.id);
+    for (const line of item.consumptions) {
+      const product = app.state.costCenter.products.find((candidate) => candidate.id === line.productId);
+      if (!product) {
+        showToast("Um dos produtos usados já não existe.");
+        return;
+      }
+      const previousUsage = productUsage(product, otherSessions).used;
+      if (previousUsage + line.amount > product.capacity) {
+        const available = Math.max(0, product.capacity - previousUsage);
+        showToast(`${product.name}: só restam ${formatCostQuantity(available, product.unit)}. Corrige a quantidade ou atualiza a capacidade da compra.`);
+        return;
+      }
+    }
+  }
+  let candidate = structuredClone(app.state);
+  if (app.costEditor.id) {
+    const index = candidate.costCenter.sessions.findIndex((current) => current.id === app.costEditor.id);
+    candidate.costCenter.sessions[index] = item;
+  } else {
+    candidate.costCenter.sessions.push(item);
+  }
+  try {
+    candidate = normalizeValidatedState(candidate, "sessão do Centro de Custos");
+  } catch (error) {
+    console.error(error);
+    showToast(integrityErrorMessage(error));
+    return;
+  }
+  rememberUndo();
+  app.state = candidate;
+  persistState();
+  closeCostSession();
+  render();
+  showToast(item.status === "completed" ? "Sessão concluída e custos distribuídos." : "Rascunho guardado.", { undo: true });
+}
+
+function closeCostSession() {
+  if (costSessionDialog?.open) costSessionDialog.close();
+  app.costEditor = null;
+}
+
+function deleteCostSession() {
+  const id = app.costEditor?.type === "session" ? app.costEditor.id : "";
+  if (!id) return;
+  const current = app.state.costCenter.sessions.find((item) => item.id === id);
+  if (!current || recordChangedSinceOpen(current, app.costEditor.original)) {
+    showToast("Esta sessão mudou entretanto. Fecha e volta a abrir antes de eliminar.");
+    return;
+  }
+  if (!confirm(uiText("Eliminar esta sessão e retirar os custos imputados aos rolos?"))) return;
+  rememberUndo();
+  app.state.costCenter.sessions = app.state.costCenter.sessions.filter((item) => item.id !== id);
+  app.state = normalizeState(app.state);
+  persistState();
+  closeCostSession();
+  render();
+  showToast("Sessão eliminada e contas recalculadas.", { undo: true });
+}
+
+function costInput(name, label, value, options = {}) {
+  const inputId = `cost-${name}`;
+  return `
+    <div class="field ${options.wrapper || ""}">
+      <label for="${escapeAttr(inputId)}">${escapeHtml(label)}</label>
+      <input id="${escapeAttr(inputId)}" name="${escapeAttr(name)}" type="${escapeAttr(options.type || "text")}" value="${escapeAttr(value ?? "")}"
+        ${options.placeholder ? `placeholder="${escapeAttr(options.placeholder)}"` : ""}
+        ${options.min != null ? `min="${escapeAttr(options.min)}"` : ""}
+        ${options.step ? `step="${escapeAttr(options.step)}"` : ""}
+        ${options.required ? "required" : ""}>
+    </div>
+  `;
+}
+
+function costSelect(name, label, options, value, config = {}) {
+  return `
+    <div class="field ${config.wrapper || ""}">
+      <label for="cost-${escapeAttr(name)}">${escapeHtml(label)}</label>
+      <select id="cost-${escapeAttr(name)}" name="${escapeAttr(name)}">
+        ${options.map((option) => `<option value="${escapeAttr(option)}" ${String(option) === String(value) ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}
+      </select>
+    </div>
+  `;
+}
+
+function costSelectOptions(name, label, options, value) {
+  return `
+    <div class="field">
+      <label for="cost-${escapeAttr(name)}">${escapeHtml(label)}</label>
+      <select id="cost-${escapeAttr(name)}" name="${escapeAttr(name)}">
+        ${options.map(([option, optionLabel]) => `<option value="${escapeAttr(option)}" ${String(option) === String(value) ? "selected" : ""}>${escapeHtml(optionLabel)}</option>`).join("")}
+      </select>
+    </div>
+  `;
+}
+
+function renderCostCenter() {
+  const center = app.state.costCenter;
+  const summary = costCenterSummary(center, app.state.rolls);
+  const integrity = costCenterIntegrityReport(center, app.state.rolls);
+  const query = normalizeSearchValue(app.filters.costSearch);
+  const products = [...center.products]
+    .filter((item) => {
+      const haystack = normalizeSearchValue([item.name, item.brand, item.category, item.notes].join(" "));
+      return (!query || haystack.includes(query))
+        && (!app.filters.costCategory || item.category === app.filters.costCategory);
+    })
+    .sort((a, b) => Number(a.status === "finished") - Number(b.status === "finished")
+      || String(b.purchaseDate || "").localeCompare(String(a.purchaseDate || ""))
+      || localeSort(a.name, b.name));
+  const sessions = [...center.sessions]
+    .filter((item) => !app.filters.costSessionStatus || item.status === app.filters.costSessionStatus)
+    .sort((a, b) => String(b.date || "").localeCompare(String(a.date || ""))
+      || String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+  const home = summary.methods.home;
+  const lab = summary.methods.lab;
+  const difference = summary.homeLabDifference;
+
+  return `
+    <section class="cost-hero">
+      <div class="cost-hero-copy">
+        <p class="kicker">Finanças do laboratório</p>
+        <h2>Quanto custa realmente cada rolo.</h2>
+        <p>Regista uma compra uma vez. Em cada sessão indica os rolos e o que usaste; o resto é calculado automaticamente.</p>
+        <div class="home-actions">
+          <button class="button primary" type="button" data-action="new-cost-session">${uiIcon("flask-conical")}<span>Nova sessão</span></button>
+          <button class="button inverse" type="button" data-action="new-cost-product">${uiIcon("receipt-text")}<span>Nova compra</span></button>
+        </div>
+      </div>
+      <div class="cost-hero-metrics">
+        ${metric("Compras registadas", formatCurrency(summary.purchaseSpend), `${formatNumber(summary.products)} produtos e consumíveis`)}
+        ${metric("Custo já utilizado", formatCurrency(summary.consumedValue), `${formatNumber(summary.sessions)} sessões concluídas`)}
+        ${metric("Média imputada", formatCurrency(summary.averagePerRoll), `${formatNumber(summary.allocatedRolls)} rolos com custos`)}
+        ${metric("Valor ainda disponível", formatCurrency(summary.remainingValue), `${formatNumber(summary.activeProducts)} produtos ativos`)}
+      </div>
+    </section>
+
+    <section class="cost-comparison-grid">
+      ${costComparisonCard("Revelação em casa", home, "house", "Químicos e consumíveis usados")}
+      ${costComparisonCard("Laboratório externo", lab, "store", "Serviços pagos a lojas")}
+      <article class="cost-comparison-card ${difference == null ? "" : difference >= 0 ? "positive" : "negative"}">
+        <span class="cost-comparison-icon">${uiIcon("scale")}</span>
+        <div>
+          <small>Diferença média</small>
+          <strong>${difference == null ? "Por calcular" : formatCurrency(Math.abs(difference))}</strong>
+          <p>${difference == null
+            ? "Regista pelo menos uma sessão em casa e uma no laboratório."
+            : difference >= 0
+              ? "poupados por rolo ao revelar em casa"
+              : "a mais por rolo ao revelar em casa"}</p>
+        </div>
+      </article>
+    </section>
+
+    ${integrity.ok ? "" : `
+      <section class="cost-warning">
+        ${uiIcon("triangle-alert")}
+        <span><strong>Há registos financeiros a rever.</strong><small>${formatNumber(integrity.missingProducts.length)} consumos sem produto · ${formatNumber(integrity.missingRolls.length)} rolos não encontrados</small></span>
+      </section>
+    `}
+
+    <section class="panel cost-products-panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <p class="section-eyebrow">Compras e autonomia</p>
+          <h3>Químicos e consumíveis</h3>
+          <span class="panel-subtitle">Rodinal, fixador, agente de lavagem, água, luvas e tudo o que quiseres controlar</span>
+        </div>
+        <button class="button primary compact-button" type="button" data-action="new-cost-product">${uiIcon("plus")}<span>Nova compra</span></button>
+      </div>
+      <div class="cost-toolbar">
+        ${filterInput("costSearch", "Pesquisar", "Produto, marca, categoria ou notas")}
+        ${filterSelect("costCategory", "Categoria", ["", ...unique(center.products.map((item) => item.category)).sort(localeSort)])}
+      </div>
+      <div class="cost-product-grid">
+        ${products.length ? products.map(costProductCard).join("") : emptyState("Ainda não há compras nesta seleção.")}
+      </div>
+    </section>
+
+    <section class="panel cost-sessions-panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <p class="section-eyebrow">Utilização real</p>
+          <h3>Sessões e serviços</h3>
+          <span class="panel-subtitle">Cada sessão distribui o custo igualmente pelos rolos escolhidos</span>
+        </div>
+        <button class="button primary compact-button" type="button" data-action="new-cost-session">${uiIcon("plus")}<span>Nova sessão</span></button>
+      </div>
+      <div class="cost-toolbar narrow">
+        ${filterSelectOptions("costSessionStatus", "Estado", [["", "Todos"], ["completed", "Concluídas"], ["draft", "Rascunhos"]])}
+      </div>
+      <div class="cost-session-list">
+        ${sessions.length ? sessions.map(costSessionRow).join("") : emptyState("Ainda não há sessões registadas.")}
+      </div>
+    </section>
+
+    ${summary.byCategory.size ? `
+      <section class="panel">
+        <div class="panel-header"><div class="panel-title"><h3>Custo utilizado por categoria</h3><span class="panel-subtitle">Apenas sessões concluídas</span></div></div>
+        ${barChart(summary.byCategory, { maxItems: 12 })}
+      </section>
+    ` : ""}
+  `;
+}
+
+function costComparisonCard(label, stats, icon, subtitle) {
+  return `
+    <article class="cost-comparison-card">
+      <span class="cost-comparison-icon">${uiIcon(icon)}</span>
+      <div>
+        <small>${escapeHtml(label)}</small>
+        <strong>${stats.rolls ? formatCurrency(stats.average) : "Sem dados"}</strong>
+        <p>${stats.rolls ? `${formatNumber(stats.rolls)} rolos · ${formatNumber(stats.sessions)} sessões` : escapeHtml(subtitle)}</p>
+      </div>
+    </article>
+  `;
+}
+
+function costProductCard(product) {
+  const usage = productUsage(product, app.state.costCenter.sessions);
+  const statusLabel = product.status === "finished" ? "Terminado" : usage.overused ? "Acima da capacidade" : "Ativo";
+  const modeLabel = product.costingMode === "rolls" ? "por rolos" : `por ${product.unit}`;
+  return `
+    <article class="cost-product-card ${product.status === "finished" ? "is-finished" : ""}">
+      <header>
+        <span class="cost-category">${escapeHtml(product.category)}</span>
+        <span class="status-pill ${product.status === "finished" ? "" : "success"}">${escapeHtml(statusLabel)}</span>
+      </header>
+      <div class="cost-product-main">
+        <h4>${escapeHtml(product.name)}</h4>
+        <p>${escapeHtml(product.brand || "Sem marca")} · ${formatCurrency(product.purchaseCost)} · ${escapeHtml(modeLabel)}</p>
+      </div>
+      <div class="cost-progress" aria-label="${escapeAttr(`${usage.percent}% utilizado`)}">
+        <span style="width:${usage.percent}%"></span>
+      </div>
+      <dl class="cost-product-stats">
+        <div><dt>Utilizado</dt><dd>${formatCostQuantity(usage.used, usage.unit)}</dd></div>
+        <div><dt>Disponível</dt><dd>${formatCostQuantity(usage.remaining, usage.unit)}</dd></div>
+        <div><dt>Custo usado</dt><dd>${formatCurrency(usage.consumedCost)}</dd></div>
+      </dl>
+      <footer>
+        <span>${product.purchaseDate ? formatDate(product.purchaseDate) : "Sem data de compra"}</span>
+        <div>
+          ${product.status === "active" ? `<button class="text-button" type="button" data-action="finish-cost-product" data-id="${escapeAttr(product.id)}">Marcar terminado</button>` : ""}
+          <button class="button secondary compact-button" type="button" data-action="edit-cost-product" data-id="${escapeAttr(product.id)}">${uiIcon("pencil")}<span>Editar</span></button>
+        </div>
+      </footer>
+    </article>
+  `;
+}
+
+function costSessionRow(session) {
+  const total = sessionCost(session, app.state.costCenter.products);
+  const method = costMethodLabel(session.method);
+  return `
+    <article class="cost-session-row ${session.status === "draft" ? "is-draft" : ""}">
+      <span class="cost-session-mark">${uiIcon(session.method === "lab" ? "store" : session.method === "home" ? "flask-conical" : "receipt-text")}</span>
+      <div class="cost-session-main">
+        <span><strong>${escapeHtml(session.title || `${method} · ${formatDate(session.date)}`)}</strong>${session.status === "draft" ? `<span class="status-pill">Rascunho</span>` : ""}</span>
+        <small>${escapeHtml(method)}${session.provider ? ` · ${escapeHtml(session.provider)}` : ""} · ${formatNumber(session.rollIds.length)} ${session.rollIds.length === 1 ? "rolo" : "rolos"}</small>
+        ${session.rollIds.length ? `<p>${session.rollIds.map((id) => `<button type="button" data-action="view-roll" data-id="${escapeAttr(id)}">${escapeHtml(id)}</button>`).join("")}</p>` : ""}
+      </div>
+      <div class="cost-session-total">
+        <strong>${session.status === "completed" ? formatCurrency(total) : "—"}</strong>
+        <small>${session.status === "completed" && session.rollIds.length ? `${formatCurrency(total / session.rollIds.length)}/rolo` : formatDate(session.date)}</small>
+      </div>
+      <button class="button secondary compact-button" type="button" data-action="edit-cost-session" data-id="${escapeAttr(session.id)}">${uiIcon("pencil")}<span>Editar</span></button>
+    </article>
+  `;
+}
+
+function formatCostQuantity(value, unit) {
+  return `${formatNumber(Math.round(numberOrZero(value) * 1000) / 1000)} ${escapeHtml(unit || "un.")}`;
+}
+
+function costMethodLabel(method) {
+  return {
+    home: "Revelação em casa",
+    lab: "Laboratório externo",
+    other: "Outro custo",
+  }[method] || "Outro custo";
+}
+
 function renderEquipmentCollection() {
   const equipment = sortEquipmentCollection(getFilteredEquipment(), app.filters.equipmentSort);
   const mode = app.viewModes.equipment;
   const totalValue = sum(equipment.map((item) => item.purchaseValue));
+  const retiredCount = app.state.equipment.filter(isRetiredEquipment).length;
 
   return `
     <section class="toolbar compact">
@@ -2128,6 +2936,7 @@ function renderEquipmentCollection() {
       ${filterSelect("equipmentKind", "Tipo", ["", ...unique(app.state.equipment.map((item) => item.kind)).sort(localeSort)])}
       ${filterSelect("equipmentStatus", "Estado", ["", ...unique(app.state.equipment.map((item) => item.status)).sort(localeSort)])}
       <div class="toolbar-actions">
+        ${retiredCount ? `<button class="button ${app.showRetiredEquipment ? "primary" : "secondary"}" type="button" data-action="toggle-retired-equipment" aria-pressed="${app.showRetiredEquipment}">${uiIcon(app.showRetiredEquipment ? "eye-off" : "eye")}<span>${app.showRetiredEquipment ? "Ocultar vendidos" : `Mostrar vendidos (${formatNumber(retiredCount)})`}</span></button>` : ""}
         <button class="button primary" type="button" data-action="new-equipment">${uiIcon("plus")}<span>Novo item</span></button>
       </div>
     </section>
@@ -2334,8 +3143,10 @@ function equipmentCatalogView(equipment) {
 }
 
 function equipmentCatalogCard(item) {
+  const imageSource = equipmentImageForItem(item);
   return `
     <article class="equipment-catalog-card">
+      ${imageSource ? `<div class="equipment-card-image"><img src="${escapeAttr(imageSource)}" alt="${escapeAttr(`${item.brand || ""} ${item.model || "Equipamento"}`.trim())}" loading="lazy" decoding="async"></div>` : ""}
       <header>
         <span class="equipment-object" aria-hidden="true">${uiIcon(equipmentIcon(item.kind))}</span>
         ${stockPill(item.status)}
@@ -2371,8 +3182,26 @@ function rollListView(rolls) {
 }
 
 function stockListView(stock) {
-  const rows = stock.map((item) => `<tr><td>${escapeHtml(item.format)}</td><td>${escapeHtml(item.brand)}</td><td>${escapeHtml(item.model)}</td><td>${escapeHtml(item.iso)}</td><td>${escapeHtml(item.type)}</td><td>${formatNumber(item.quantity)}</td><td>${stockPill(item.condition)}</td><td>${formatDate(item.expiryDate)}</td><td>${escapeHtml(item.note)}</td><td class="table-action"><div class="table-action-stack"><button class="button primary compact-button" type="button" data-action="new-roll-from-stock" data-id="${escapeAttr(item.id)}" ${numberOrZero(item.quantity) > 0 ? "" : "disabled"}>${uiIcon("circle-plus")}<span>Carregar</span></button><button class="button secondary compact-button" type="button" data-action="edit-stock" data-id="${escapeAttr(item.id)}">${uiIcon("pencil")}<span>Editar</span></button></div></td></tr>`).join("");
-  return `<section class="panel collection-list-panel"><div class="list-table"><table class="stock-table"><thead><tr><th>Formato</th><th>Marca</th><th>Modelo</th><th>ISO</th><th>Tipo</th><th>Qtd</th><th>Estado</th><th>Validade</th><th>Nota</th><th class="table-action">Ação</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+  const rows = stock.map((item) => `
+    <tr>
+      <td class="stock-mobile-summary">
+        <span class="stock-mobile-format">${escapeHtml(item.format || "—")}</span>
+        <span class="stock-mobile-name"><small>${escapeHtml(item.brand || "Sem marca")}</small><strong>${escapeHtml(item.model || "Sem modelo")}</strong></span>
+        ${stockPill(item.condition)}
+      </td>
+      <td class="stock-list-format">${escapeHtml(item.format)}</td>
+      <td class="stock-list-brand">${escapeHtml(item.brand)}</td>
+      <td class="stock-list-model">${escapeHtml(item.model)}</td>
+      <td class="stock-list-iso">${escapeHtml(item.iso)}</td>
+      <td class="stock-list-type">${escapeHtml(item.type)}</td>
+      <td class="stock-list-quantity"><strong>${formatNumber(item.quantity)}</strong></td>
+      <td class="stock-list-condition">${stockPill(item.condition)}</td>
+      <td class="stock-list-expiry">${formatDate(item.expiryDate) || "—"}</td>
+      <td class="stock-list-note">${escapeHtml(item.note || "—")}</td>
+      <td class="table-action"><div class="table-action-stack"><button class="button primary compact-button" type="button" data-action="new-roll-from-stock" data-id="${escapeAttr(item.id)}" ${numberOrZero(item.quantity) > 0 ? "" : "disabled"}>${uiIcon("circle-plus")}<span>Carregar</span></button><button class="button secondary compact-button" type="button" data-action="edit-stock" data-id="${escapeAttr(item.id)}">${uiIcon("pencil")}<span>Editar</span></button></div></td>
+    </tr>
+  `).join("");
+  return `<section class="panel collection-list-panel"><div class="list-table"><table class="stock-table"><thead><tr><th class="stock-mobile-summary">Filme</th><th>Formato</th><th>Marca</th><th>Modelo</th><th>ISO</th><th>Tipo</th><th>Qtd</th><th>Estado</th><th>Validade</th><th>Nota</th><th class="table-action">Ação</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
 }
 
 function equipmentListView(equipment) {
@@ -2625,6 +3454,7 @@ function renderEquipment() {
 
 function renderArchive() {
   const stats = getStats();
+  const costs = costCenterSummary(app.state.costCenter, app.state.rolls);
   const automaticBackup = Boolean(app.state.meta.autoCloudBackup);
   const replacementPending = isImportedReplacementPending();
   const lastCloudBackup = formatDateTime(app.state.meta.lastCloudBackupAt);
@@ -2693,6 +3523,8 @@ function renderArchive() {
           ${archiveSummaryRow("Stock", stats.stockTotal)}
           ${archiveSummaryRow("Equipamento", stats.equipmentCount)}
           ${archiveSummaryRow("Valor do equipamento", formatCurrency(stats.equipmentValue))}
+          ${archiveSummaryRow("Compras no centro de custos", costs.products)}
+          ${archiveSummaryRow("Sessões de custos", costs.sessions + costs.drafts)}
         </div>
       </section>
 
@@ -2739,6 +3571,17 @@ function renderArchive() {
 
       ${renderCloudHistoryPanel()}
 
+      <section class="panel manual-panel">
+        <div class="panel-header">
+          <div class="panel-title">
+            <h3>Manual de utilização</h3>
+            <span class="panel-subtitle">Guia completo, passo a passo, disponível mesmo sem internet</span>
+          </div>
+        </div>
+        <p class="helper-text">Explica como registar rolos antigos e novos, gerir stock, equipamento, custos, backups e resolver os problemas mais comuns.</p>
+        <a class="button secondary" href="manual.html" target="_blank" rel="noopener">${uiIcon("book-open")}<span>Abrir manual completo</span></a>
+      </section>
+
       <section class="panel">
         <div class="panel-header">
           <div class="panel-title">
@@ -2763,26 +3606,34 @@ function archiveSummaryRow(label, value) {
 
 function renderArchiveIntegrityPanel() {
   const report = archiveIntegrityReport(app.state);
+  const fullReport = applicationIntegrityReport(app.state);
+  const allOk = fullReport.ok;
+  const invalidIdentity = fullReport.invalidRollIds.length
+    + fullReport.rollDateMismatches.length
+    + fullReport.missingRequired.length;
+  const invalidReferences = fullReport.missingReferences.length
+    + fullReport.duplicateReferences.length;
   const devices = app.cloud.devices || [];
   const lastCheck = text(app.state.workflow.lastIntegrityCheckAt);
   return `
-    <section class="panel integrity-panel ${report.ok ? "ok" : "warning"}">
+    <section class="panel integrity-panel ${allOk ? "ok" : "warning"}">
       <div class="panel-header">
         <div class="panel-title">
           <h3>Confiança nos dados</h3>
           <span class="panel-subtitle">${lastCheck ? `Última verificação: ${escapeHtml(formatDateTime(lastCheck))}` : "Verificação local pronta a executar"}</span>
         </div>
-        <button class="button ${report.ok ? "secondary" : "primary"} compact-button" type="button" data-action="run-integrity-check">${uiIcon("shield-check")}<span>Verificar agora</span></button>
+        <button class="button ${allOk ? "secondary" : "primary"} compact-button" type="button" data-action="run-integrity-check">${uiIcon("shield-check")}<span>Verificar agora</span></button>
       </div>
       <div class="integrity-grid">
-        ${integrityMetric("IDs duplicados", report.duplicateIds.length, report.duplicateIds.length === 0)}
-        ${integrityMetric("IDs inválidos", report.invalidIds.length, report.invalidIds.length === 0)}
-        ${integrityMetric("Datas incompatíveis", report.dateMismatches.length, report.dateMismatches.length === 0)}
+        ${integrityMetric("IDs duplicados", fullReport.duplicateCount, fullReport.duplicateCount === 0)}
+        ${integrityMetric("Identificação e datas", invalidIdentity, invalidIdentity === 0)}
+        ${integrityMetric("Valores inválidos", fullReport.invalidValues.length, fullReport.invalidValues.length === 0)}
+        ${integrityMetric("Referências inválidas", invalidReferences, invalidReferences === 0)}
         ${integrityMetric("Sem arquivo físico", report.missingArchive.length, report.missingArchive.length === 0)}
       </div>
       <div class="device-sync-list">
         <strong>Dispositivos conhecidos</strong>
-        ${devices.length ? devices.map((device) => `<span>${uiIcon(device.id === getDeviceId() ? "monitor-check" : "smartphone")}<span><strong>${escapeHtml(device.label || "Dispositivo")}</strong><small>${escapeHtml(formatDateTime(device.lastSeenAt))} · v${escapeHtml(device.releaseVersion || "?")} · revisão ${formatNumber(device.revision)}</small></span></span>`).join("") : '<small>A lista aparece depois da primeira sincronização da v2.5.</small>'}
+        ${devices.length ? devices.map((device) => `<span>${uiIcon(device.id === getDeviceId() ? "monitor-check" : "smartphone")}<span><strong>${escapeHtml(device.label || "Dispositivo")}</strong><small>${escapeHtml(formatDateTime(device.lastSeenAt))} · v${escapeHtml(device.releaseVersion || "?")} · revisão ${formatNumber(device.revision)}</small></span></span>`).join("") : '<small>A lista aparece depois da primeira sincronização da v2.8.1.</small>'}
       </div>
     </section>
   `;
@@ -2793,13 +3644,14 @@ function integrityMetric(label, value, ok) {
 }
 
 function runIntegrityCheck() {
-  const report = archiveIntegrityReport(app.state);
+  const report = applicationIntegrityReport(app.state);
+  app.integrityBlocked = !report.ok;
   app.state.workflow.lastIntegrityCheckAt = new Date().toISOString();
   persistState();
   render();
   showToast(report.ok
-    ? `Arquivo coerente: ${report.rolls} rolos, sem IDs duplicados nem datas incompatíveis.`
-    : `Foram encontrados ${report.duplicateIds.length + report.invalidIds.length + report.dateMismatches.length + report.negativeStock.length} problemas de integridade.`);
+    ? `Arquivo coerente: ${report.totals.rolls} rolos, valores e referências sem incompatibilidades.`
+    : `Foram encontrados ${report.errorCount} problemas. A sincronização permanece pausada até serem corrigidos.`);
 }
 
 function renderDriveBackupPanel() {
@@ -3499,7 +4351,7 @@ function renderCommandResults() {
 
   const rolls = sortCommandRolls(app.state.rolls.filter((roll) => commandRollText(roll).includes(query))).slice(0, 10);
   const stock = app.state.stock.filter((item) => commandStockText(item).includes(query)).slice(0, 6);
-  const equipment = app.state.equipment.filter((item) => commandEquipmentText(item).includes(query)).slice(0, 6);
+  const equipment = app.state.equipment.filter((item) => !isRetiredEquipment(item) && commandEquipmentText(item).includes(query)).slice(0, 6);
   commandResults.innerHTML = `
     ${commandSection("Rolos", rolls.map(commandRollResult))}
     ${commandSection("Stock", stock.map(commandStockResult))}
@@ -3706,6 +4558,19 @@ async function handleAction(event) {
   if (action === "edit-stock") openEditor("stock", id);
   if (action === "new-equipment") openEditor("equipment");
   if (action === "edit-equipment") openEditor("equipment", id);
+  if (action === "new-cost-product") openCostProduct();
+  if (action === "edit-cost-product") openCostProduct(id);
+  if (action === "finish-cost-product") finishCostProduct(id);
+  if (action === "close-cost-product") closeCostProduct();
+  if (action === "delete-cost-product") deleteCostProduct();
+  if (action === "new-cost-session") openCostSession();
+  if (action === "edit-cost-session") openCostSession(id);
+  if (action === "close-cost-session") closeCostSession();
+  if (action === "delete-cost-session") deleteCostSession();
+  if (action === "toggle-retired-equipment") {
+    app.showRetiredEquipment = !app.showRetiredEquipment;
+    render();
+  }
   if (action === "close-dialog") closeEditor();
   if (action === "close-detail") closeDetails();
   if (action === "detail-edit") editDetailRoll();
@@ -3892,8 +4757,11 @@ function openEditor(type, id = null, options = {}) {
     type,
     id,
     item: structuredClone(item),
+    original: id ? structuredClone(baseItem) : null,
     stockItemId: text(options.stockItemId),
   };
+  dialog.classList.toggle("roll-entry-dialog", type === "roll");
+  dialog.classList.toggle("new-roll-entry-dialog", type === "roll" && !id);
   dialogTitle.textContent = id ? editorTitle(type, item) : newEditorTitle(type);
   dialogKicker.textContent = editorKicker(type);
   editorFields.innerHTML = renderEditorFields(type, app.editor.item);
@@ -4048,17 +4916,34 @@ function openDetails(id) {
 
 function renderDetails(roll) {
   const next = getNextStatus(roll.status);
+  const filmVisual = findFilmImage({
+    brand: roll.filmBrand,
+    model: roll.filmModel,
+    iso: roll.iso,
+    format: roll.format,
+  });
+  const filmImageSource = filmVisual?.image?.src || "";
+  const cameraVisual = findEquipmentImageForRoll(roll.camera, ["Câmara", "Camera"]);
+  const lensVisual = findEquipmentImageForRoll(roll.lens, ["Lente", "Lens"]);
+  const equipmentVisuals = [cameraVisual, lensVisual].filter(Boolean);
   detailTitle.textContent = `Rolo ${roll.id}`;
   detailKicker.textContent = `${roll.status || "Sem estado"} · ${formatDate(roll.date)}`;
   detailPrimaryAction.textContent = next ? `Avançar para ${next}` : "Arquivado";
   detailPrimaryAction.disabled = !next;
 
   detailContent.innerHTML = `
-    <section class="detail-hero-panel">
-      <div>
+    <section class="detail-hero-panel ${filmImageSource ? "has-film-image" : ""}">
+      ${filmImageSource ? `<img class="detail-hero-film" src="${escapeAttr(filmImageSource)}" alt="" aria-hidden="true">` : ""}
+      <div class="detail-hero-shade" aria-hidden="true"></div>
+      <div class="detail-hero-copy">
         <p class="kicker">${escapeHtml(buildFilmLabel(roll, { includePush: true }))}</p>
         <h3>${escapeHtml(roll.camera || "Sem câmara")}</h3>
         <span class="detail-subtitle">${escapeHtml(roll.shotLocation || "Sem local")} · ${escapeHtml(roll.folderName)}</span>
+        ${equipmentVisuals.length ? `<div class="detail-hero-equipment">${equipmentVisuals.map((visual) => `
+          <figure>
+            <img src="${escapeAttr(visual.src)}" alt="${escapeAttr(visual.label || "Equipamento")}" loading="eager" decoding="async">
+            <figcaption>${escapeHtml(visual.label || "Equipamento")}</figcaption>
+          </figure>`).join("")}</div>` : ""}
       </div>
       <div class="detail-status-block">
         <button class="favorite-toggle labeled ${roll.favorite ? "active" : ""}" type="button" data-action="toggle-favorite" data-id="${escapeAttr(roll.id)}" aria-label="${roll.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}" title="${roll.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}">${uiIcon("star")}<span>${roll.favorite ? "Favorito" : "Marcar favorito"}</span></button>
@@ -4085,7 +4970,9 @@ function renderDetails(roll) {
       ${detailField("Revelado em", roll.developedAt)}
       ${detailField("Digitalizado em", roll.scannedAt)}
       ${detailField("Revelador/método", roll.developerMethod)}
-      ${detailField("Custo total", formatCurrency(rollCost(roll)))}
+      ${detailField("Custos no rolo", formatCurrency(rollCost(roll)))}
+      ${detailField("Centro de custos", formatCurrency(allocatedCostForRoll(app.state.costCenter, roll.id)))}
+      ${detailField("Custo total real", formatCurrency(rollTotalCost(roll, app.state.costCenter)))}
       ${detailField("Disparo concluído", formatDate(roll.shotCompletedAt))}
       ${detailField("Revelação concluída", formatDate(roll.developmentCompletedAt))}
       ${detailField("Digitalização concluída", formatDate(roll.scanCompletedAt))}
@@ -4155,13 +5042,13 @@ function saveEditor(event) {
     if (field.type === "checkbox") {
       values[field.name] = input.checked;
     } else if (field.type === "number") {
-      values[field.name] = input.value === "" ? 0 : Number(input.value);
+      values[field.name] = input.value === "" && field.allowBlank ? "" : (input.value === "" ? 0 : Number(input.value));
     } else {
       values[field.name] = input.value.trim();
     }
   });
 
-  if (app.editor.type === "roll") {
+  if (editorType === "roll") {
     const photosInput = editorForm.elements.photosUrl;
     photosInput?.setCustomValidity("");
     if (values.photosUrl && !safeExternalUrl(values.photosUrl)) {
@@ -4172,11 +5059,21 @@ function saveEditor(event) {
     if (values.photosUrl) values.photosUrl = safeExternalUrl(values.photosUrl);
   }
 
-  if (app.editor.type === "roll" && !values.id) {
+  if (editorType === "roll" && isNewRoll) {
+    values.date = calendarMonthToIso(values.date);
+    if (!values.date) {
+      showToast("Escolhe um mês de entrada válido.");
+      editorForm.elements.date?.focus();
+      return;
+    }
     values.id = nextRollId(values.date);
+    if (!values.id) {
+      showToast("Não foi possível criar o próximo ID deste mês. Confirma os registos existentes.");
+      return;
+    }
   }
 
-  if (app.editor.type === "roll") {
+  if (editorType === "roll") {
     values.id = normalizeRollId(values.id);
     const idCalendar = rollCalendarFromId(values.id);
     if (!idCalendar.valid) {
@@ -4189,8 +5086,25 @@ function saveEditor(event) {
       showToast(`O ID ${values.id} já existe. O rolo não foi guardado.`);
       return;
     }
+    for (const field of ["filmCost", "developmentCost", "scanCost"]) {
+      if (!Number.isFinite(Number(values[field])) || Number(values[field]) < 0) {
+        showToast("Os custos do rolo não podem ser negativos.");
+        editorForm.elements[field]?.focus();
+        return;
+      }
+    }
+    if (values.iso !== "" && (!Number.isFinite(Number(values.iso)) || Number(values.iso) <= 0)) {
+      showToast("O ISO deve ser um número superior a zero ou ficar vazio.");
+      editorForm.elements.iso?.focus();
+      return;
+    }
     values.date = idCalendar.date;
+    const previousId = text(app.editor.id);
+    const previousNegativeCode = normalizeRollId(app.editor.original?.negativeCode || previousId);
     values.negativeCode = normalizeRollId(values.negativeCode || values.id);
+    if (previousId && previousId !== values.id && values.negativeCode === previousNegativeCode) {
+      values.negativeCode = values.id;
+    }
     values.folderName = buildFolderName(values);
     const milestone = statusMilestoneField(values.status);
     const previous = app.editor.id ? app.state.rolls.find((roll) => roll.id === app.editor.id) : null;
@@ -4199,17 +5113,52 @@ function saveEditor(event) {
     }
   }
 
-  rememberUndo();
-  const collection = collectionFor(app.editor.type);
+  if (editorType === "stock") {
+    if (!values.brand || !values.model) {
+      showToast("O stock precisa de marca e modelo.");
+      (editorForm.elements.brand || editorForm.elements.model)?.focus();
+      return;
+    }
+    if (!Number.isInteger(Number(values.quantity)) || Number(values.quantity) < 0) {
+      showToast("A quantidade de stock deve ser um número inteiro igual ou superior a zero.");
+      editorForm.elements.quantity?.focus();
+      return;
+    }
+    if (!Number.isFinite(Number(values.unitCost)) || Number(values.unitCost) < 0) {
+      showToast("O custo por rolo não pode ser negativo.");
+      editorForm.elements.unitCost?.focus();
+      return;
+    }
+  }
+
+  if (editorType === "equipment") {
+    if (!values.kind || !values.model) {
+      showToast("O equipamento precisa de tipo e modelo.");
+      (editorForm.elements.kind || editorForm.elements.model)?.focus();
+      return;
+    }
+    if (!Number.isFinite(Number(values.purchaseValue)) || Number(values.purchaseValue) < 0) {
+      showToast("O valor de aquisição não pode ser negativo.");
+      editorForm.elements.purchaseValue?.focus();
+      return;
+    }
+  }
+
+  const collection = collectionFor(editorType);
+  if (!currentEditorRecordIsSafe(collection, app.editor.id, app.editor.original)) return;
+  let candidate = structuredClone(app.state);
   if (app.editor.id) {
-    const index = app.state[collection].findIndex((item) => item.id === app.editor.id);
-    app.state[collection][index] = { ...app.state[collection][index], ...values };
+    const index = candidate[collection].findIndex((item) => item.id === app.editor.id);
+    candidate[collection][index] = { ...candidate[collection][index], ...values };
+    if (editorType === "roll" && app.editor.id !== values.id) {
+      candidate = remapRollIdReferences(candidate, app.editor.id, values.id);
+    }
   } else {
-    app.state[collection].push({ ...values, id: values.id || createId(app.editor.type) });
+    candidate[collection].push({ ...values, id: values.id || createId(editorType) });
   }
 
   if (stockItemId) {
-    const stockItem = app.state.stock.find((item) => item.id === stockItemId);
+    const stockItem = candidate.stock.find((item) => item.id === stockItemId);
     if (stockItem && numberOrZero(stockItem.quantity) > 0) {
       stockItem.quantity = numberOrZero(stockItem.quantity) - 1;
       stockWasUpdated = true;
@@ -4218,9 +5167,22 @@ function saveEditor(event) {
     }
   }
 
-  app.state = normalizeState(app.state);
+  try {
+    candidate = normalizeValidatedState(candidate, "registo editado");
+  } catch (error) {
+    console.error(error);
+    showToast(integrityErrorMessage(error));
+    return;
+  }
+  rememberUndo();
+  const previousRollId = editorType === "roll" ? text(app.editor.id) : "";
+  app.state = candidate;
   persistState();
   closeEditor();
+  if (previousRollId && previousRollId !== values.id && app.physicalSelection.has(previousRollId)) {
+    app.physicalSelection.delete(previousRollId);
+    app.physicalSelection.add(values.id);
+  }
   render();
   showToast(stockWasUpdated
     ? "Rolo guardado e stock atualizado."
@@ -4239,12 +5201,26 @@ function saveEditor(event) {
 
 function deleteEditorItem() {
   if (!app.editor?.id) return;
+  const collection = collectionFor(app.editor.type);
+  if (!currentEditorRecordIsSafe(collection, app.editor.id, app.editor.original)) return;
+  if (app.editor.type === "roll" && app.state.costCenter.sessions.some((session) => session.rollIds.includes(app.editor.id))) {
+    showToast("Este rolo está associado ao Centro de Custos. Retira-o primeiro das sessões para preservar as contas.");
+    return;
+  }
   const confirmed = confirm(uiText("Eliminar este registo?"));
   if (!confirmed) return;
 
+  let candidate = structuredClone(app.state);
+  candidate[collection] = candidate[collection].filter((item) => item.id !== app.editor.id);
+  try {
+    candidate = normalizeValidatedState(candidate, "arquivo depois da eliminação");
+  } catch (error) {
+    console.error(error);
+    showToast(integrityErrorMessage(error, "A eliminação criaria referências inválidas."));
+    return;
+  }
   rememberUndo();
-  const collection = collectionFor(app.editor.type);
-  app.state[collection] = app.state[collection].filter((item) => item.id !== app.editor.id);
+  app.state = candidate;
   persistState();
   closeEditor();
   render();
@@ -4270,15 +5246,24 @@ function renderEditorFields(type, item) {
   if (remaining.length) {
     sections.push(`<details class="form-section"><summary>Outros dados${uiIcon("chevron-down")}</summary><div class="form-section-grid">${remaining.map((field) => renderField(field, item)).join("")}</div></details>`);
   }
-  const quickStart = type === "roll" && !app.editor?.id ? renderRollQuickStart() : "";
-  return quickStart + sections.join("");
+  const isNewRoll = type === "roll" && !app.editor?.id;
+  const quickStart = isNewRoll ? renderRollQuickStart() : "";
+  const intro = isNewRoll ? `
+    <section class="roll-entry-summary">
+      <span class="roll-entry-summary-icon">${uiIcon("circle-check-big")}</span>
+      <span><strong>Registo simples</strong><small>Preenche o que souberes. Os restantes detalhes continuam disponíveis, mas ficam arrumados.</small></span>
+      <output data-roll-id-preview>${escapeHtml(nextRollId(item.date))}</output>
+    </section>
+  ` : "";
+  return intro + quickStart + sections.join("");
 }
 
 function editorFieldGroups(type) {
   if (type === "roll") {
     if (!app.editor?.id) {
       return [
-        { label: "Dados essenciais", fields: ["date", "camera", "lens", "filmBrand", "filmModel", "iso", "format", "type", "push", "shotLocation", "project"], open: true },
+        { label: "O essencial", fields: ["date", "camera", "filmBrand", "filmModel", "iso", "format"], open: true },
+        { label: "Detalhes opcionais", fields: ["lens", "type", "push", "shotLocation", "project"], open: false },
         { label: "Identificação automática", fields: ["id", "status", "negativeCode"], open: false },
         { label: "Processamento e custos", fields: ["developedAt", "scannedAt", "developerMethod", "filmCost", "developmentCost", "scanCost", "shotCompletedAt", "developmentCompletedAt", "scanCompletedAt", "archivedAt"], open: false },
         { label: "Arquivo físico e notas", fields: ["folderName", "photosUrl", "archiveLocation", "negativePresent", "contactSheetPresent", "scanFilesPresent", "favorite", "notes"], open: false },
@@ -4287,8 +5272,8 @@ function editorFieldGroups(type) {
     return [
       { label: "Identificação", fields: ["id", "status", "date", "negativeCode"], open: true },
       { label: "Captura", fields: ["camera", "lens", "filmBrand", "filmModel", "iso", "format", "type", "push", "shotLocation", "project"], open: true },
-      { label: "Processamento e custos", fields: ["developedAt", "scannedAt", "developerMethod", "filmCost", "developmentCost", "scanCost", "shotCompletedAt", "developmentCompletedAt", "scanCompletedAt", "archivedAt"], open: true },
-      { label: "Arquivo", fields: ["folderName", "photosUrl", "archiveLocation", "negativePresent", "contactSheetPresent", "scanFilesPresent", "favorite", "notes"], open: true },
+      { label: "Processamento e custos", fields: ["developedAt", "scannedAt", "developerMethod", "filmCost", "developmentCost", "scanCost", "shotCompletedAt", "developmentCompletedAt", "scanCompletedAt", "archivedAt"], open: false },
+      { label: "Arquivo", fields: ["folderName", "photosUrl", "archiveLocation", "negativePresent", "contactSheetPresent", "scanFilesPresent", "favorite", "notes"], open: false },
     ];
   }
   if (type === "stock") {
@@ -4306,7 +5291,9 @@ function editorFieldGroups(type) {
 function renderRollQuickStart() {
   const recentRolls = sortRolls(app.state.rolls);
   const templates = app.state.workflow.templates.slice(0, 8);
-  const cameras = recentUniqueValues(recentRolls, (roll) => roll.camera, 4);
+  const cameras = recentUniqueValues(recentRolls, (roll) => roll.camera, 12)
+    .filter((value) => !matchesRetiredEquipmentName(value, ["Câmara", "Camera"]))
+    .slice(0, 4);
   const locations = recentUniqueValues(recentRolls, (roll) => roll.shotLocation, 4);
   const stockItems = app.state.stock
     .filter((item) => numberOrZero(item.quantity) > 0)
@@ -4346,25 +5333,29 @@ function renderRollQuickStart() {
   const activeCategory = selectedStockId && categories.some((category) => category.id === "stock")
     ? "stock"
     : categories[0]?.id;
+  if (!categories.length) return "";
 
   return `
-    <section class="roll-quick-start">
-      <div class="quick-start-heading">
-        <div>
-          <span class="catalog-overline">Preenchimento rápido</span>
-          <strong>Escolhe o que já tens e evita voltar a escrever.</strong>
-        </div>
+    <details class="roll-quick-start" ${selectedStockId ? "open" : ""}>
+      <summary class="quick-start-heading">
         ${uiIcon("zap")}
+        <div>
+          <strong>Usar preenchimento rápido</strong>
+          <small>Câmara recente, modelo pessoal ou filme em stock</small>
+        </div>
+        ${uiIcon("chevron-down")}
+      </summary>
+      <div class="quick-start-content">
+        <div class="quick-preset-tabs" role="tablist" aria-label="Escolhas rápidas">
+          ${categories.map((category) => `<button class="${category.id === activeCategory ? "active" : ""}" type="button" role="tab" aria-selected="${category.id === activeCategory}" data-action="select-quick-preset-tab" data-preset="${category.id}">${uiIcon(category.icon)}<span>${category.label}</span></button>`).join("")}
+        </div>
+        ${categories.map((category) => `<div class="quick-preset-row" data-quick-preset-pane="${category.id}" ${category.id === activeCategory ? "" : "hidden"}><span>${category.title}</span><div>${category.buttons}</div></div>`).join("")}
+        <label class="quick-stock-choice" data-stock-consumption ${selectedStockId ? "" : "hidden"}>
+          <input type="checkbox" name="consumeStock" ${selectedStockId ? "checked" : ""}>
+          <span>Retirar uma unidade deste stock ao guardar</span>
+        </label>
       </div>
-      <div class="quick-preset-tabs" role="tablist" aria-label="Escolhas rápidas">
-        ${categories.map((category) => `<button class="${category.id === activeCategory ? "active" : ""}" type="button" role="tab" aria-selected="${category.id === activeCategory}" data-action="select-quick-preset-tab" data-preset="${category.id}">${uiIcon(category.icon)}<span>${category.label}</span></button>`).join("")}
-      </div>
-      ${categories.map((category) => `<div class="quick-preset-row" data-quick-preset-pane="${category.id}" ${category.id === activeCategory ? "" : "hidden"}><span>${category.title}</span><div>${category.buttons}</div></div>`).join("")}
-      <label class="quick-stock-choice" data-stock-consumption ${selectedStockId ? "" : "hidden"}>
-        <input type="checkbox" name="consumeStock" ${selectedStockId ? "checked" : ""}>
-        <span>Retirar uma unidade deste stock ao guardar</span>
-      </label>
-    </section>
+    </details>
   `;
 }
 
@@ -4434,7 +5425,9 @@ function startFieldDictation(fieldName) {
 
 function renderField(field, item) {
   const value = item[field.name] ?? "";
+  const inputValue = field.type === "month" ? text(value).slice(0, 7) : value;
   const label = `<label for="field-${field.name}">${escapeHtml(field.label)}</label>`;
+  const help = field.help ? `<small class="field-help">${escapeHtml(field.help)}</small>` : "";
 
   if (field.type === "textarea") {
     return `
@@ -4488,7 +5481,8 @@ function renderField(field, item) {
     return `
       <div class="field ${field.wide ? "wide" : ""}">
         ${label}
-        <output class="computed-output" data-computed="${escapeAttr(field.name)}">${escapeHtml(value)}</output>
+        <output class="computed-output" data-computed="${escapeAttr(field.name)}">${escapeHtml(inputValue)}</output>
+        ${help}
       </div>
     `;
   }
@@ -4496,41 +5490,51 @@ function renderField(field, item) {
   return `
     <div class="field ${field.wide ? "wide" : ""}">
       ${label}
-      <input id="field-${field.name}" name="${escapeAttr(field.name)}" type="${escapeAttr(field.type || "text")}" value="${escapeAttr(value)}" ${field.step ? `step="${escapeAttr(field.step)}"` : ""}>
+      <input id="field-${field.name}" name="${escapeAttr(field.name)}" type="${escapeAttr(field.type || "text")}" value="${escapeAttr(inputValue)}"
+        ${field.min != null ? `min="${escapeAttr(field.min)}"` : ""}
+        ${field.max != null ? `max="${escapeAttr(field.max)}"` : ""}
+        ${field.step ? `step="${escapeAttr(field.step)}"` : ""}
+        ${field.required ? "required" : ""}>
+      ${help}
     </div>
   `;
 }
 
 function fieldsFor(type) {
   const statusOptions = unique([...app.state.support.statuses, ...app.state.rolls.map((roll) => roll.status)]);
-  const cameraOptions = unique(app.state.rolls.map((roll) => roll.camera)).sort(localeSort);
-  const lensOptions = unique(app.state.rolls.map((roll) => roll.lens)).sort(localeSort);
+  const cameraOptions = unique(app.state.rolls.map((roll) => roll.camera))
+    .filter((value) => !matchesRetiredEquipmentName(value, ["Câmara", "Camera"]))
+    .sort(localeSort);
+  const lensOptions = unique(app.state.rolls.map((roll) => roll.lens))
+    .filter((value) => !matchesRetiredEquipmentName(value, ["Lente", "Lens"]))
+    .sort(localeSort);
   const brandOptions = unique([...app.state.support.filmBrands, ...app.state.rolls.map((roll) => roll.filmBrand), ...app.state.stock.map((item) => item.brand)]).sort(localeSort);
   const modelOptions = unique([...app.state.rolls.map((roll) => roll.filmModel), ...app.state.stock.map((item) => item.model)]).sort(localeSort);
   const labOptions = unique([...app.state.rolls.map((roll) => roll.developedAt), ...app.state.rolls.map((roll) => roll.scannedAt)]).sort(localeSort);
 
   if (type === "roll") {
+    const isNew = !app.editor?.id;
     return [
-      { name: "id", label: "ID rolo", type: "text" },
+      { name: "id", label: isNew ? "Próximo ID" : "ID rolo", type: isNew ? "computed" : "text" },
       { name: "status", label: "Estado", type: "select", options: statusOptions },
-      { name: "date", label: "Data", type: "date" },
+      { name: "date", label: "Mês de entrada", type: isNew ? "month" : "computed", required: isNew, help: isNew ? "Podes escolher um mês antigo. O ID é calculado automaticamente." : "É determinado pelo mês e ano do ID." },
       { name: "negativeCode", label: "Código negativo", type: "text" },
       { name: "camera", label: "Câmara", type: "combo", options: cameraOptions },
       { name: "lens", label: "Lente", type: "combo", options: lensOptions },
       { name: "filmBrand", label: "Marca do rolo", type: "combo", options: brandOptions },
       { name: "filmModel", label: "Modelo", type: "combo", options: modelOptions },
-      { name: "iso", label: "ISO", type: "number" },
+      { name: "iso", label: "ISO", type: "number", min: 1, step: "1", allowBlank: true },
       { name: "format", label: "Formato", type: "select", options: ["135", "120"] },
       { name: "type", label: "Tipo", type: "select", options: ["B&W", "Cor"] },
-      { name: "push", label: "Push", type: "number" },
+      { name: "push", label: "Push", type: "number", min: 0, step: "1" },
       { name: "shotLocation", label: "Local disparado", type: "text", wide: true },
       { name: "project", label: "Projeto/viagem", type: "text", wide: true },
       { name: "developedAt", label: "Local revelado", type: "combo", options: labOptions },
       { name: "scannedAt", label: "Local digitalizado", type: "combo", options: labOptions },
       { name: "developerMethod", label: "Revelador/método", type: "text", wide: true },
-      { name: "filmCost", label: "Custo do filme", type: "number", step: "0.01" },
-      { name: "developmentCost", label: "Custo da revelação", type: "number", step: "0.01" },
-      { name: "scanCost", label: "Custo da digitalização", type: "number", step: "0.01" },
+      { name: "filmCost", label: "Custo do filme", type: "number", min: 0, step: "0.01" },
+      { name: "developmentCost", label: "Custo da revelação", type: "number", min: 0, step: "0.01" },
+      { name: "scanCost", label: "Custo da digitalização", type: "number", min: 0, step: "0.01" },
       { name: "shotCompletedAt", label: "Disparo concluído", type: "date" },
       { name: "developmentCompletedAt", label: "Revelação concluída", type: "date" },
       { name: "scanCompletedAt", label: "Digitalização concluída", type: "date" },
@@ -4553,10 +5557,10 @@ function fieldsFor(type) {
       { name: "format", label: "Formato", type: "select", options: ["135", "120"] },
       { name: "iso", label: "ISO", type: "number" },
       { name: "type", label: "Tipo", type: "select", options: ["B&W", "Cor"] },
-      { name: "quantity", label: "Quantidade", type: "number" },
+      { name: "quantity", label: "Quantidade", type: "number", min: 0, step: "1", required: true },
       { name: "condition", label: "Estado", type: "select", options: ["Novo", "Expirado"] },
       { name: "purchasedAt", label: "Data de compra", type: "date" },
-      { name: "unitCost", label: "Custo por rolo", type: "number", step: "0.01" },
+      { name: "unitCost", label: "Custo por rolo", type: "number", min: 0, step: "0.01" },
       { name: "expiryDate", label: "Validade", type: "date" },
       { name: "note", label: "Nota", type: "textarea" },
     ];
@@ -4568,7 +5572,7 @@ function fieldsFor(type) {
     { name: "model", label: "Modelo", type: "text" },
     { name: "system", label: "Sistema", type: "text" },
     { name: "purchaseDate", label: "Data aquisição", type: "date" },
-    { name: "purchaseValue", label: "Valor aquisição", type: "number", step: "0.01" },
+    { name: "purchaseValue", label: "Valor aquisição", type: "number", min: 0, step: "0.01" },
     { name: "status", label: "Estado", type: "select", options: app.state.support.equipmentStatuses },
     { name: "lastServiceDate", label: "Última revisão", type: "date" },
     { name: "notes", label: "Notas", type: "textarea" },
@@ -4836,10 +5840,30 @@ function getFilteredEquipment() {
       item.notes,
     ].join(" "));
 
-    return (!search || haystack.includes(search))
+    const includeRetired = app.showRetiredEquipment
+      || (app.filters.equipmentStatus && item.status === app.filters.equipmentStatus);
+    return (!isRetiredEquipment(item) || includeRetired)
+      && (!search || haystack.includes(search))
       && (!app.filters.equipmentKind || item.kind === app.filters.equipmentKind)
       && (!app.filters.equipmentStatus || item.status === app.filters.equipmentStatus);
   }).sort((a, b) => localeSort(a.kind, b.kind) || localeSort(a.brand, b.brand) || localeSort(a.model, b.model));
+}
+
+function isRetiredEquipment(item) {
+  const status = normalizeSearchValue(item?.status);
+  return ["vendido", "vendida", "abatido", "abatida", "retirado", "retirada", "descartado", "descartada"].includes(status);
+}
+
+function matchesRetiredEquipmentName(value, kinds = []) {
+  const target = normalizeSearchValue(value);
+  if (!target) return false;
+  const normalizedKinds = kinds.map(normalizeSearchValue);
+  return app.state.equipment.some((item) => {
+    if (!isRetiredEquipment(item) || (normalizedKinds.length && !normalizedKinds.includes(normalizeSearchValue(item.kind)))) return false;
+    const model = normalizeSearchValue(item.model);
+    const full = normalizeSearchValue(`${item.brand} ${item.model}`);
+    return target === model || target === full || (model.length > 3 && target.includes(model));
+  });
 }
 
 function getStatsRolls() {
@@ -5108,9 +6132,23 @@ function statusMilestoneField(status) {
 
 function refreshComputedFields() {
   if (!app.editor || app.editor.type !== "roll") return;
-  const output = editorFields.querySelector('[data-computed="folderName"]');
-  if (!output) return;
-  output.textContent = buildFolderName(readEditorDraft());
+  const draft = readEditorDraft();
+  if (!app.editor.id) {
+    draft.date = calendarMonthToIso(draft.date);
+    draft.id = draft.date ? nextRollId(draft.date) : "";
+    draft.negativeCode = draft.negativeCode || draft.id;
+  } else {
+    const calendar = rollCalendarFromId(draft.id);
+    if (calendar.valid) draft.date = calendar.date;
+  }
+  const idOutput = editorFields.querySelector('[data-computed="id"]');
+  const dateOutput = editorFields.querySelector('[data-computed="date"]');
+  const folderOutput = editorFields.querySelector('[data-computed="folderName"]');
+  const previewOutput = editorFields.querySelector("[data-roll-id-preview]");
+  if (idOutput) idOutput.textContent = draft.id || "Por calcular";
+  if (dateOutput) dateOutput.textContent = draft.date ? formatDate(draft.date) : "ID inválido";
+  if (folderOutput) folderOutput.textContent = buildFolderName(draft);
+  if (previewOutput) previewOutput.textContent = draft.id || "Por calcular";
 }
 
 function readEditorDraft() {
@@ -5151,6 +6189,12 @@ function stockPill(status) {
 }
 
 function exportJson() {
+  try {
+    assertApplicationIntegrity(app.state, "arquivo atual");
+  } catch (error) {
+    showToast(integrityErrorMessage(error, "Corrige os problemas antes de exportar o backup."));
+    return;
+  }
   persistState();
   download(
     `rolos-backup-${todayStamp()}.json`,
@@ -5169,6 +6213,7 @@ function exportCsv(name, rows, columns) {
 
 async function exportExcelWorkbook() {
   try {
+    assertApplicationIntegrity(app.state, "arquivo atual");
     await loadXlsxLibrary();
     const workbook = window.XLSX.utils.book_new();
     const rollRows = app.state.rolls.map((roll) => ({
@@ -5227,16 +6272,57 @@ async function exportExcelWorkbook() {
       "Data Revisão Realizada": item.lastServiceDate,
       Notas: item.notes,
     }));
+    const costProductRows = app.state.costCenter.products.map((item) => ({
+      ID: item.id,
+      Produto: item.name,
+      Categoria: item.category,
+      Marca: item.brand,
+      "Data Compra": item.purchaseDate,
+      "Custo Total": item.purchaseCost,
+      Modo: item.costingMode,
+      Capacidade: item.capacity,
+      Unidade: item.unit,
+      Estado: item.status,
+      Notas: item.notes,
+      Criado: item.createdAt,
+      Atualizado: item.updatedAt,
+      Terminado: item.finishedAt,
+    }));
+    const costSessionRows = app.state.costCenter.sessions.map((item) => ({
+      ID: item.id,
+      Data: item.date,
+      Titulo: item.title,
+      Metodo: item.method,
+      Fornecedor: item.provider,
+      Estado: item.status,
+      "IDs Rolos": item.rollIds.join(";"),
+      "Custo Direto": item.directCost,
+      Notas: item.notes,
+      Criado: item.createdAt,
+      Atualizado: item.updatedAt,
+      Concluido: item.completedAt,
+    }));
+    const costConsumptionRows = app.state.costCenter.sessions.flatMap((session) =>
+      session.consumptions.map((item) => ({
+        "ID Sessao": session.id,
+        "ID Produto": item.productId,
+        Quantidade: item.amount,
+      })));
 
     appendWorkbookSheet(workbook, "Registos Rolos", rollRows);
     appendWorkbookSheet(workbook, "Stock 35mm", stockRows("135"));
     appendWorkbookSheet(workbook, "Stock 120mm", stockRows("120"));
     appendWorkbookSheet(workbook, "Equipamento", equipmentRows);
+    appendWorkbookSheet(workbook, "Custos Compras", costProductRows);
+    appendWorkbookSheet(workbook, "Custos Sessoes", costSessionRows);
+    appendWorkbookSheet(workbook, "Custos Consumos", costConsumptionRows);
     window.XLSX.writeFile(workbook, `rolos-export-${todayStamp()}.xlsx`, { compression: true });
     showToast("Excel exportado. Pode voltar a ser importado pela app.");
   } catch (error) {
     console.error(error);
-    showToast("Não foi possível criar o Excel. Confirma a ligação à internet e tenta novamente.");
+    showToast(error?.code === "rolos/integrity-validation"
+      ? error.message
+      : "Não foi possível criar o Excel. Confirma a ligação à internet e tenta novamente.");
   }
 }
 
@@ -5252,7 +6338,8 @@ function appendWorkbookSheet(workbook, name, rows) {
 function installImportedArchive(imported) {
   const previousSync = normalizeCloudBackupMeta(app.state?.meta || {});
   const needsOnlineReplacement = isPrivateAccessRequired();
-  const next = normalizeState(imported);
+  assertApplicationIntegrity(imported, "arquivo importado");
+  const next = normalizeValidatedState(imported, "arquivo importado");
   next.meta = {
     ...next.meta,
     ...previousSync,
@@ -5296,7 +6383,8 @@ async function importJson(file) {
     const textValue = await file.text();
     const raw = JSON.parse(textValue);
     raw.rolls = reconcileImportedRollDates(raw.rolls, "backup JSON");
-    const imported = normalizeState(raw);
+    assertApplicationIntegrity(raw, "backup JSON");
+    const imported = normalizeValidatedState(raw, "backup JSON");
     const diff = backupRestoreDiff(app.state, imported);
     if (!confirm(uiText(`Pré-visualização do restauro:\n${restoreDiffSummary(diff)}\n\nContinuar e substituir os dados atuais?`))) return;
     const bundledSeed = await loadSeed();
@@ -5309,7 +6397,7 @@ async function importJson(file) {
       : "Backup importado.");
   } catch (error) {
     console.error(error);
-    showToast(error?.code === "rolos/import-validation"
+    showToast(["rolos/import-validation", "rolos/integrity-validation"].includes(error?.code)
       ? error.message
       : "O ficheiro não parece ser um backup válido.");
   }
@@ -5319,7 +6407,8 @@ async function verifyJsonBackup(file) {
   try {
     const raw = JSON.parse(await file.text());
     raw.rolls = reconcileImportedRollDates(raw.rolls, "backup JSON");
-    const candidate = normalizeState(raw);
+    assertApplicationIntegrity(raw, "backup JSON");
+    const candidate = normalizeValidatedState(raw, "backup JSON");
     const diff = backupRestoreDiff(app.state, candidate);
     const report = diff.candidateIntegrity;
     showToast(report.ok
@@ -5337,6 +6426,7 @@ function restoreDiffSummary(diff) {
     `Rolos: ${diff.currentRolls} → ${diff.candidateRolls}`,
     `Novos: ${diff.added.length} · removidos: ${diff.removed.length} · alterados: ${diff.changed.length}`,
     `Stock: ${diff.stockDelta >= 0 ? "+" : ""}${diff.stockDelta} · equipamento: ${diff.equipmentDelta >= 0 ? "+" : ""}${diff.equipmentDelta}`,
+    `Centro de custos: ${diff.costProductDelta >= 0 ? "+" : ""}${diff.costProductDelta} compras · ${diff.costSessionDelta >= 0 ? "+" : ""}${diff.costSessionDelta} sessões`,
     `Integridade: ${integrity.ok ? "sem erros" : `${integrity.duplicateIds.length + integrity.invalidIds.length + integrity.dateMismatches.length} problemas`}`,
   ].join("\n");
 }
@@ -5349,18 +6439,20 @@ async function importExcel(file) {
     await loadXlsxLibrary();
     const buffer = await file.arrayBuffer();
     const workbook = window.XLSX.read(buffer, { type: "array", cellDates: true });
-    const imported = normalizeState(buildStateFromExcelWorkbook(workbook, file.name));
+    const workbookState = buildStateFromExcelWorkbook(workbook, file.name);
+    assertApplicationIntegrity(workbookState, "Excel");
+    const imported = normalizeValidatedState(workbookState, "Excel");
     const bundledSeed = await loadSeed();
     imported.meta.seedRevision = bundledSeed.meta?.seedRevision || imported.meta.seedRevision || app.state.meta.seedRevision || SEED_REVISION;
     imported.meta.releaseVersion = RELEASE_VERSION;
-    installImportedArchive(normalizeState(mergeSeedUpgrade(app.state, imported)));
+    installImportedArchive(normalizeValidatedState(mergeSeedUpgrade(app.state, imported), "arquivo reconciliado"));
     render();
     showToast(isImportedReplacementPending()
       ? "Excel importado localmente. Confirma agora o novo início no Firebase."
       : "Excel importado.");
   } catch (error) {
     console.error(error);
-    showToast(error?.code === "rolos/import-validation"
+    showToast(["rolos/import-validation", "rolos/integrity-validation"].includes(error?.code)
       ? error.message
       : "Não consegui importar este Excel. Confirma se tem as folhas esperadas.");
   }
@@ -5384,6 +6476,9 @@ function buildStateFromExcelWorkbook(workbook, sourceFile) {
   const stock35Rows = readExcelTable(workbook, "Stock 35mm", ["Marca", "Modelo", "Quantidade"], false);
   const stock120Rows = readExcelTable(workbook, "Stock 120mm", ["Marca", "Modelo", "Quantidade"], false);
   const equipmentRows = readExcelTable(workbook, "Equipamento", ["Tipo", "Marca", "Modelo"], false);
+  const costProductRows = readExcelTable(workbook, "Custos Compras", ["ID", "Produto", "Custo Total"], false);
+  const costSessionRows = readExcelTable(workbook, "Custos Sessoes", ["ID", "Data", "Estado"], false);
+  const costConsumptionRows = readExcelTable(workbook, "Custos Consumos", ["ID Sessao", "ID Produto", "Quantidade"], false);
 
   const rolls = reconcileImportedRollDates(rollsRows.map((row) => {
     const id = normalizeRollId(row["ID Rolo"]);
@@ -5445,6 +6540,55 @@ function buildStateFromExcelWorkbook(workbook, sourceFile) {
     notes: cleanExcelValue(row.Notas),
     createdFrom: "excel",
   }));
+  const hasCostSheets = ["Custos Compras", "Custos Sessoes", "Custos Consumos"]
+    .some((name) => Boolean(workbook.Sheets[name]));
+  const consumptionsBySession = new Map();
+  costConsumptionRows.forEach((row) => {
+    const sessionId = cleanExcelValue(row["ID Sessao"]);
+    if (!sessionId) return;
+    const items = consumptionsBySession.get(sessionId) || [];
+    items.push({
+      productId: cleanExcelValue(row["ID Produto"]),
+      amount: numberOrZero(row.Quantidade),
+    });
+    consumptionsBySession.set(sessionId, items);
+  });
+  const importedCostCenter = hasCostSheets ? {
+    products: costProductRows.map((row, index) => ({
+      id: cleanExcelValue(row.ID) || `custo-excel-${index + 1}`,
+      name: cleanExcelValue(row.Produto),
+      category: cleanExcelValue(row.Categoria),
+      brand: cleanExcelValue(row.Marca),
+      purchaseDate: excelDateToIso(row["Data Compra"]),
+      purchaseCost: numberOrZero(row["Custo Total"]),
+      costingMode: cleanExcelValue(row.Modo),
+      capacity: numberOrZero(row.Capacidade),
+      unit: cleanExcelValue(row.Unidade),
+      status: cleanExcelValue(row.Estado),
+      notes: cleanExcelValue(row.Notas),
+      createdAt: cleanExcelValue(row.Criado),
+      updatedAt: cleanExcelValue(row.Atualizado),
+      finishedAt: cleanExcelValue(row.Terminado),
+    })),
+    sessions: costSessionRows.map((row, index) => {
+      const id = cleanExcelValue(row.ID) || `sessao-excel-${index + 1}`;
+      return {
+        id,
+        date: excelDateToIso(row.Data),
+        title: cleanExcelValue(row.Titulo),
+        method: cleanExcelValue(row.Metodo),
+        provider: cleanExcelValue(row.Fornecedor),
+        status: cleanExcelValue(row.Estado),
+        rollIds: cleanExcelValue(row["IDs Rolos"]).split(/[;,\s]+/).filter(Boolean),
+        consumptions: consumptionsBySession.get(id) || [],
+        directCost: numberOrZero(row["Custo Direto"]),
+        notes: cleanExcelValue(row.Notas),
+        createdAt: cleanExcelValue(row.Criado),
+        updatedAt: cleanExcelValue(row.Atualizado),
+        completedAt: cleanExcelValue(row.Concluido),
+      };
+    }),
+  } : structuredClone(app.state?.costCenter || {});
 
   return {
     meta: {
@@ -5453,11 +6597,12 @@ function buildStateFromExcelWorkbook(workbook, sourceFile) {
       importedAt: new Date().toISOString(),
       seedRevision: SEED_REVISION,
       releaseVersion: RELEASE_VERSION,
-      version: 4,
+      version: 6,
     },
     rolls,
     stock,
     equipment,
+    costCenter: importedCostCenter,
     support: defaultSupport,
   };
 }
@@ -5523,7 +6668,7 @@ async function resetSeed() {
   const confirmed = confirm(uiText("Repor os dados iniciais importados do Excel?"));
   if (!confirmed) return;
 
-  app.state = normalizeState(mergeSeedUpgrade(app.state, await loadSeed()));
+  app.state = normalizeValidatedState(mergeSeedUpgrade(app.state, await loadSeed()), "dados iniciais");
   persistState();
   render();
   showToast("Importação inicial reposta.");
@@ -5819,6 +6964,7 @@ async function resetCloudFromCurrentArchive() {
   try {
     const timestamp = new Date().toISOString();
     const stateSnapshot = structuredClone(app.state);
+    assertApplicationIntegrity(stateSnapshot, "arquivo local");
     const contentHash = stateFingerprint(stateSnapshot);
     stateSnapshot.meta = {
       ...stateSnapshot.meta,
@@ -5859,7 +7005,7 @@ async function resetCloudFromCurrentArchive() {
       });
     });
 
-    app.state = normalizeState(stateSnapshot);
+    app.state = normalizeValidatedState(stateSnapshot, "novo arquivo online");
     persistState({ skipAutomaticBackup: true, preserveUpdatedAt: true });
     setImportedReplacementPending(false);
     app.cloud.history = [];
@@ -5888,6 +7034,18 @@ async function resetCloudFromCurrentArchive() {
 async function pushCloudBackup(options = {}) {
   if (isImportedReplacementPending() && !options.allowImportedReplacement) {
     showToast("Usa “Começar do zero online” para tornar a base importada na nova versão 1.");
+    return false;
+  }
+  try {
+    assertApplicationIntegrity(app.state, "arquivo local");
+  } catch (error) {
+    app.integrityBlocked = true;
+    app.state.meta.autoCloudBackup = false;
+    app.state.meta.cloudBackupPending = false;
+    app.cloud.status = "Sincronização pausada: a verificação local encontrou dados incoerentes.";
+    persistState({ skipAutomaticBackup: true, preserveUpdatedAt: true });
+    if (!options.silent) showToast(integrityErrorMessage(error));
+    if (app.ready) render();
     return false;
   }
   if (app.cloud.backupInProgress) return false;
@@ -6073,7 +7231,7 @@ async function synchronizeWithCloud(options = {}) {
       const cloudHash = cloudRecord.contentHash || stateFingerprint(cloudRecord.payload);
       if (requiresSyncSchemaUpgrade(cloudRecord)) {
         if (app.state.meta.cloudBackupPending && localHash !== cloudHash) {
-          await saveRecoveryCloudBackup(app.state, "antes da migração segura para a v2.5");
+          await saveRecoveryCloudBackup(app.state, "antes da migração segura para a v2.8.1");
         }
         await applyCloudRecord(cloudRecord);
         return pushCloudBackup({ silent: options.silent, skipConnect: true });
@@ -6140,7 +7298,9 @@ async function synchronizeWithCloud(options = {}) {
 
 async function applyCloudRecord(cloudRecord) {
   const localMeta = app.state?.meta || {};
-  const payload = normalizeState(structuredClone(cloudRecord.payload));
+  const rawPayload = structuredClone(cloudRecord.payload);
+  assertApplicationIntegrity(rawPayload, "versão online");
+  const payload = normalizeValidatedState(rawPayload, "versão online");
   payload.meta.seedRevision = localMeta.seedRevision || payload.meta.seedRevision;
   payload.meta.releaseVersion = RELEASE_VERSION;
   payload.meta.autoCloudBackup = localMeta.autoCloudBackup !== false;
@@ -6513,6 +7673,7 @@ async function restoreCloudVersion(id) {
       readCloudBackup("current"),
     ]);
     if (!selected?.payload) throw new Error("A cópia selecionada já não existe.");
+    assertApplicationIntegrity(selected.payload, "backup Firebase");
     const diff = backupRestoreDiff(app.state, selected.payload);
     const confirmed = confirm(uiText(`Pré-visualização desta versão:\n${restoreDiffSummary(diff)}\n\nRepor agora? A versão atual ficará guardada como cópia de recuperação.`));
     if (!confirmed) {
@@ -6522,7 +7683,7 @@ async function restoreCloudVersion(id) {
     }
     await saveRecoveryCloudBackup(app.state, "antes de repor uma versão anterior");
 
-    const restored = normalizeState(selected.payload);
+    const restored = normalizeValidatedState(selected.payload, "backup Firebase");
     restored.meta.autoCloudBackup = true;
     restored.meta.cloudBackupInitialized = true;
     restored.meta.cloudRevision = numberOrZero(current?.revision);
@@ -6548,6 +7709,11 @@ function toggleAutomaticCloudBackup() {
     return;
   }
   const enabled = !app.state.meta.autoCloudBackup;
+  if (enabled && !applicationIntegrityReport(app.state).ok) {
+    app.integrityBlocked = true;
+    showToast("Corrige primeiro os problemas indicados em Confiança nos dados.");
+    return;
+  }
   app.state.meta.autoCloudBackup = enabled;
   if (enabled) app.state.meta.cloudBackupPending = true;
   persistState({ skipAutomaticBackup: true });
@@ -6611,7 +7777,12 @@ function getDeviceId() {
 }
 
 function hasUserArchiveData(state) {
-  return Boolean(state?.rolls?.length || state?.stock?.length || state?.equipment?.length || Object.keys(state?.filmImages || {}).length);
+  return Boolean(state?.rolls?.length
+    || state?.stock?.length
+    || state?.equipment?.length
+    || state?.costCenter?.products?.length
+    || state?.costCenter?.sessions?.length
+    || Object.keys(state?.filmImages || {}).length);
 }
 
 function download(filename, type, content) {
@@ -6635,6 +7806,14 @@ function csvCell(value) {
 function nextRollId(dateValue) {
   const calendarDate = calendarValueToIso(dateValue) || localCalendarDateToIso(new Date());
   return nextRollIdForMonth(calendarDate, (app.state?.rolls || []).map((roll) => roll.id));
+}
+
+function calendarMonthToIso(value) {
+  const raw = text(value);
+  const month = /^(\d{4})-(\d{2})$/.exec(raw);
+  if (month) return calendarValueToIso(`${month[1]}-${month[2]}-01`);
+  const fullDate = calendarValueToIso(raw);
+  return fullDate ? `${fullDate.slice(0, 7)}-01` : "";
 }
 
 function normalizeRollId(value) {
