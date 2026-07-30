@@ -16,9 +16,9 @@ import {
   stateFingerprint,
 } from "../app/sync-core.js";
 
-assert.equal(SYNC_SCHEMA_VERSION, 3, "v2.5 must block older writers that would drop additive fields");
-assert.equal(requiresSyncSchemaUpgrade({ schemaVersion: 2, payload: { meta: { syncSchemaVersion: 2 } } }), true);
-assert.equal(requiresSyncSchemaUpgrade({ schemaVersion: 3, payload: { meta: { syncSchemaVersion: 3 } } }), false);
+assert.equal(SYNC_SCHEMA_VERSION, 4, "v2.7 must block older writers that would drop cost-centre data");
+assert.equal(requiresSyncSchemaUpgrade({ schemaVersion: 3, payload: { meta: { syncSchemaVersion: 3 } } }), true);
+assert.equal(requiresSyncSchemaUpgrade({ schemaVersion: 4, payload: { meta: { syncSchemaVersion: 4 } } }), false);
 
 function state(overrides = {}) {
   return {
@@ -30,6 +30,7 @@ function state(overrides = {}) {
     rolls: overrides.rolls || [{ id: "01012026", notes: "original" }],
     stock: overrides.stock || [],
     equipment: overrides.equipment || [],
+    costCenter: overrides.costCenter || { version: 1, products: [], sessions: [] },
     filmImages: overrides.filmImages || {},
     support: overrides.support || { statuses: ["Em Uso", "Arquivado"] },
   };
@@ -40,11 +41,17 @@ const sameWithReorderedKeys = {
   support: original.support,
   filmImages: {},
   equipment: [],
+  costCenter: { version: 1, products: [], sessions: [] },
   stock: [],
   rolls: [{ notes: "original", id: "01012026" }],
   meta: { cloudBackupPending: true, cloudRevision: 99 },
 };
 assert.equal(stateFingerprint(original), stateFingerprint(sameWithReorderedKeys), "metadata and object key order must not affect the content hash");
+assert.notEqual(
+  stateFingerprint(original),
+  stateFingerprint(state({ costCenter: { version: 1, products: [{ id: "rodinal", name: "Rodinal" }], sessions: [] } })),
+  "cost-centre changes must affect the cloud content hash"
+);
 
 const cloudV3 = { revision: 3, payload: original, contentHash: stateFingerprint(original) };
 assert.equal(chooseSyncAction(state({ meta: { cloudRevision: 3 } }), cloudV3), "same");

@@ -2,7 +2,7 @@
 
 O Rolos é uma aplicação para catalogar fotografia analógica: acompanha cada rolo desde o carregamento até ao arquivo, gere o stock, organiza equipamento e apresenta estatísticas e um mapa dos locais fotografados.
 
-[Guia de instalação passo a passo](INSTALLATION-PT.md) · [Guia de utilização](USAGE-PT.md) · [Privacidade dos locais](GEOCODING-PRIVACY.md)
+[Manual completo para principiantes](MANUAL-PT.md) · [Guia de instalação passo a passo](INSTALLATION-PT.md) · [Roteiro até à v3.0](ROTEIRO-ATE-V3.0.md) · [Privacidade dos locais](GEOCODING-PRIVACY.md)
 
 ## Porque foi criado
 
@@ -13,12 +13,19 @@ O projeto foi pensado e desenvolvido com a ajuda do OpenAI Codex.
 ## O que inclui
 
 - Fluxo de estados desde `Em Uso` até `Arquivado`.
+- Formulário de novo rolo simplificado, com os campos essenciais primeiro e detalhes opcionais organizados.
+- Registo seguro de rolos antigos, calculando o próximo ID dentro do mês escolhido.
 - Stock de filmes, validades e imagens de embalagens.
+- Centro de custos para químicos, filmes, água, luvas e outros consumíveis.
+- Sessões em casa ou laboratório com imputação automática e comparação do custo médio por rolo.
 - Catálogo de câmaras, lentes e acessórios.
+- Equipamento vendido ou abatido oculto por defeito, sem apagar o histórico.
 - Pesquisa, filtros, estatísticas e mapa.
 - Posicionamento automático de novos locais ao guardar um rolo.
 - Interface em português e inglês.
 - Importação e exportação em JSON, Excel e CSV.
+- Verificação integral antes de importar, exportar, restaurar ou sincronizar.
+- Proteção contra duplicados, valores inválidos, referências quebradas e formulários desatualizados.
 - Datas de calendário protegidas contra mudanças de fuso horário; na importação, o mês e o ano do ID do rolo são definitivos.
 - Novo início protegido para substituir uma base Firebase antiga depois de importar um backup.
 - Dados locais e sincronização privada opcional com Firebase.
@@ -27,6 +34,7 @@ O projeto foi pensado e desenvolvido com a ajuda do OpenAI Codex.
 - Cada cópia manual no Google Drive cria um ficheiro independente, mesmo na mesma semana.
 - Escolhas rápidas do novo rolo organizadas numa grelha tátil, sem arrastar lateralmente.
 - Instalação como app no Android e no Windows.
+- Manual completo dentro da aplicação, disponível mesmo sem internet.
 
 ## Base de demonstração
 

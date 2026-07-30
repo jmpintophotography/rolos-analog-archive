@@ -14,6 +14,8 @@ const indexSource = await read("app/index.html");
 const stylesSource = await read("app/styles.css");
 const swSource = await read("app/sw.js");
 const firebaseConfig = await read("app/firebase-config.js");
+const filmImageCatalog = await read("app/data/film-images.js");
+const equipmentImageCatalog = await read("app/data/equipment-images.js");
 
 assert.equal(seed.rolls.length, 10, "The public database must contain exactly 10 demo rolls.");
 assert.ok(seed.rolls.every((roll) => roll.createdFrom === "demo"));
@@ -21,17 +23,19 @@ assert.ok(seed.rolls.every((roll) => !roll.photosUrl));
 assert.equal(seed.meta.releaseVersion, "2.1");
 assert.match(firebaseConfig, /demoMode:\s*true/);
 assert.match(firebaseConfig, /privateAccess:\s*false/);
-assert.match(appSource, /const RELEASE_VERSION = "2\.5"/);
+assert.match(appSource, /const RELEASE_VERSION = "2\.8\.1"/);
 assert.match(appSource, /Organiza cada rolo, acompanha o processo e mantém o foco na fotografia\./);
 assert.doesNotMatch(appSource, /Registos e Stock v3\.xlsx/);
 assert.match(indexSource, /data-action="toggle-language"/);
-assert.match(indexSource, />v2\.5</);
+assert.match(indexSource, />v2\.8\.1</);
 assert.match(indexSource, /data-lucide="globe-2"/);
+assert.match(indexSource, /class="nav-item" href="\.\/manual\.html"/);
+assert.match(indexSource, /data-lucide="book-open"/);
 assert.match(stylesSource, /grid-template-columns: 44px 64px 44px minmax\(0, 1fr\)/);
 assert.match(stylesSource, /white-space: nowrap/);
 assert.match(appSource, /data-action="new-roll-from-stock"/);
 assert.match(appSource, /data-action="duplicate-roll"/);
-assert.match(appSource, /Preenchimento rápido/);
+assert.match(appSource, /Usar preenchimento rápido/);
 assert.match(appSource, /consumeStock/);
 assert.match(appSource, /openCommandPalette/);
 assert.match(appSource, /getArchiveReview/);
@@ -39,7 +43,17 @@ assert.match(appSource, /toggleFavorite/);
 assert.match(appSource, /undoLastChange/);
 assert.match(swSource, /\.\/geocoding\.js/);
 assert.match(swSource, /\.\/i18n\.js/);
-assert.doesNotMatch(swSource, /film-packages/);
+assert.match(swSource, /assets\/film-packages/);
+assert.match(swSource, /assets\/equipment/);
+assert.match(swSource, /\.\/data\/equipment-images\.js/);
+assert.equal((filmImageCatalog.match(/\bsrc:/g) || []).length, 70);
+assert.equal((equipmentImageCatalog.match(/\bsrc:/g) || []).length, 28);
+assert.match(equipmentImageCatalog, /camera-leica-m6/);
+assert.match(equipmentImageCatalog, /accessory-godox-im30pro/);
+assert.match(appSource, /detail-hero-film/);
+assert.match(appSource, /findEquipmentImageForRoll/);
+assert.match(appSource, /stock-mobile-summary/);
+assert.match(stylesSource, /\.stock-table \.stock-mobile-summary/);
 assert.match(swSource, /\.\/calendar-dates\.js/);
 assert.ok(seed.rolls.every((roll) => rollCalendarFromId(roll.id).date === roll.date));
 assert.equal(nextRollIdForMonth("2026-07-01", ["01072026", "03072026"]), "04072026");
@@ -52,6 +66,18 @@ assert.match(appSource, /renderArchiveIntegrityPanel/);
 assert.match(appSource, /renderPhysicalArchivePanel/);
 assert.match(appSource, /backupRestoreDiff/);
 assert.match(swSource, /\.\/v25-core\.js/);
+assert.match(swSource, /\.\/cost-center-core\.js/);
+assert.match(swSource, /\.\/integrity-core\.js/);
+assert.match(swSource, /\.\/manual\.html/);
+assert.match(appSource, /renderCostCenter/);
+assert.match(appSource, /normalizeCostCenter/);
+assert.match(appSource, /normalizeValidatedState/);
+assert.match(appSource, /recordChangedSinceOpen/);
+assert.match(appSource, /remapRollIdReferences/);
+assert.match(appSource, /Detalhes opcionais/);
+assert.match(appSource, /isNew \? "month" : "computed"/);
+assert.match(appSource, /toggle-retired-equipment/);
+assert.match(indexSource, /data-view="costs"/);
 
 assert.equal(normalizeLanguage("en-US"), "en");
 assert.equal(normalizeLanguage("pt-PT"), "pt");
@@ -106,7 +132,7 @@ for (const path of await walk(root)) {
   }
 }
 
-console.log("Rolos v2.5 public checks passed: demo privacy, quick capture, physical archive, backup confidence, operational metrics, calendar dates, ID increment, search, translations, geocoding and offline shell.");
+console.log("Rolos v2.8.1 public checks passed: demo privacy, offline manual navigation, full integrity checks, historical ID increment, simplified roll entry, cost centre, hidden sold equipment, visual detail, equipment catalogue, quick capture, physical archive, backup confidence, operational metrics, calendar dates, search, translations, geocoding and offline shell.");
 
 async function walk(directory) {
   const paths = [];
