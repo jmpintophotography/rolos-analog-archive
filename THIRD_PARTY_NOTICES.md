@@ -1,5 +1,11 @@
 # Third-party notices
 
+## Product reference images
+
+The v2.6 film-package and equipment photographs are not covered by the MIT licence for the application code. Their source pages, usage classifications and identification confidence are listed in `docs/image-sources.json` and summarized in `docs/IMAGE-SOURCES-PT.md`.
+
+Images identified as manufacturer, retailer, museum, editorial, database or review references remain subject to the terms and rights of their respective sources. Creative Commons images retain the licence stated in the source manifest. Downstream publishers are responsible for confirming that their intended redistribution is permitted.
+
 ## Lucide Icons
 
 The application bundles Lucide Icons 1.8.0 for reliable offline controls.

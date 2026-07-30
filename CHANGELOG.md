@@ -1,5 +1,43 @@
 # Changelog
 
+## 2.8.1 — 2026-07-26
+
+- Added a dedicated Manual item to the desktop sidebar and mobile bottom navigation.
+- Included the complete manual as an offline site page with an index and return-to-app action.
+- Preserved the v2.8 database, sync schema, Firebase rules and all existing behaviour.
+
+## 2.8.0 — 2026-07-26
+
+- Added a full data-integrity layer for rolls, stock, equipment, cost records and templates.
+- Added duplicate, invalid-value, broken-reference and stale-edit protection.
+- Validated application data before import, export, restore and synchronisation.
+- Simplified the new-roll form while keeping every existing field.
+- Added historical month entry with safe per-month ID generation.
+- Added a complete beginner manual inside the offline app and to the public documentation.
+- Preserved sync schema 4, Firestore rules and all existing archive data.
+
+## 2.7.0 — 2026-07-26
+
+- Added a cost centre for chemicals, film, consumables and external services.
+- Added quantity-based and roll-capacity costing, completed sessions, drafts and automatic per-roll allocation.
+- Added home-versus-lab averages, remaining value and category/month financial summaries.
+- Added JSON and Excel round-trip support for cost-centre records.
+- Hid sold and written-off equipment by default while preserving its history.
+- Upgraded sync schema to 4 so older clients cannot discard cost-centre data.
+
+## 2.6.0 - 2026-07-26
+
+- Added optional film backgrounds and camera/lens visuals to the roll detail view.
+- Added image-ready equipment catalogue cards with responsive mobile layouts.
+- Preserved sync schema 3 and every existing data workflow.
+- Included the researched film and equipment photographs with a source manifest and a separate image-rights notice.
+
+## 2.5.1 - 2026-07-22
+
+- Updated the application release and offline cache while preserving sync schema 3.
+- Added lazy image loading support to the packaging catalogue.
+- Kept the public demo free of private film-package photographs and personal data.
+
 ## 2.5.0 - 2026-07-18
 
 - Added quick capture with reusable personal templates, repeat-last setup and save-and-add-another.

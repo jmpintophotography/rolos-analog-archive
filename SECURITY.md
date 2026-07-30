@@ -2,7 +2,7 @@
 
 ## Supported version
 
-Security fixes are applied to the latest published release. The current release is 2.5.
+Security fixes are applied to the latest published release. The current release is 2.6.
 
 ## Private deployment checklist
 

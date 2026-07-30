@@ -1,11 +1,11 @@
 {
   "name": "rolos-analog-archive",
-  "version": "2.5.0",
+  "version": "2.8.1",
   "private": true,
   "type": "module",
   "description": "A private-first archive for analogue film rolls, stock and equipment.",
   "scripts": {
-    "test": "node tests/run-tests.mjs && node tests/sync-core-test.mjs && node tests/v25-core-test.mjs"
+    "test": "node tests/run-tests.mjs && node tests/sync-core-test.mjs && node tests/v25-core-test.mjs && node tests/cost-center-core-test.mjs && node tests/integrity-core-test.mjs"
   },
   "engines": {
     "node": ">=20"
